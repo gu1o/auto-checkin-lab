@@ -1,100 +1,92 @@
-# Check-in automático — Saúde da Entrega (Ideal Lab)
+# Check-in Automático — Saúde da Entrega (Ideal Lab)
 
-Script em bash que preenche o check-in diário de **Saúde da Entrega** no Ideal Lab
-(`https://lab.idealtrends.io/saude-entrega/daily`) via HTTP, sem navegador.
+Script e Extensão do Chrome para preencher e auditar o check-in diário de **Saúde da Entrega** no Ideal Lab (`https://lab.idealtrends.io/saude-entrega/daily`).
 
-## Arquivos
+---
 
-| Arquivo | Descrição |
+## 📂 Estrutura de Arquivos
+
+| Arquivo/Diretório | Descrição |
 |---|---|
-| `checkin.sh` | O script (subcomandos `status` e `submit`) |
-| `cookies.txt.example` | Template do cookie jar — copie para `cookies.txt` e preencha |
-| `README.md` | Este guia |
+| `checkin.sh` | CLI principal (subcomandos `status`, `submit` e `auto`) |
+| `auto_activity.py` | Script auxiliar que busca tarefas no Jira, commits no Bitbucket e sintetiza textos usando Gemini |
+| `config.json.example` | Template de configuração para as integrações do Jira, Bitbucket e Gemini |
+| `extension/` | Código fonte da Extensão do Chrome (Interface Gráfica com Auditoria) |
+| `cookies.txt.example` | Template do cookie jar para uso exclusivo via CLI |
 
-## Requisitos
+---
 
-- `bash`, `curl` e `python3` (usados para parsear o JSON do Inertia e decodificar o token CSRF)
-- Uma conta no Ideal Lab com acesso à página de Saúde da Entrega
+## 💻 Opção 1: Extensão do Chrome (Interface Gráfica + Auditoria)
 
-## Configuração (uma vez)
+Esta é a opção recomendada caso você prefira **revisar e auditar** os textos gerados antes de enviá-los ao Ideal Lab, eliminando totalmente a necessidade de copiar cookies manualmente.
 
-O script autentica com o cookie **`remember_web_*`** do Laravel, que é de longa duração.
-Para obtê-lo:
+### 🔧 Instalação:
+1. Abra o Google Chrome e navegue até `chrome://extensions/`.
+2. No canto superior direito, ative a opção **Modo do desenvolvedor** (Developer mode).
+3. Clique em **Carregar sem compactação** (Load unpacked) no canto superior esquerdo.
+4. Selecione a pasta `extension` deste projeto (`/Users/marcone/Downloads/lab-checkin/extension`).
 
-1. Faça login normalmente em `https://lab.idealtrends.io` no navegador (marque "lembrar de mim", se houver).
-2. Abra o DevTools (F12) → aba **Application/Storage** → **Cookies** → `https://lab.idealtrends.io`.
-3. Localize o cookie cujo nome começa com `remember_web_` (o sufixo é um hash fixo da aplicação)
-   e copie **nome completo** e **valor** (o valor é longo e termina em `%3D` — copie url-encoded, como está).
+### 🚀 Como usar:
+1. Clique no ícone da extensão na barra de ferramentas do Chrome.
+2. Acesse a aba **Configurações** e preencha suas credenciais do Jira, Bitbucket e Gemini API Key. As credenciais ficam salvas de forma segura no storage local do seu próprio navegador.
+3. Na aba **Check-in**, selecione a iniciativa e clique em **Gerar Rascunho**. O rascunho de *Ontem* e *Hoje* será carregado automaticamente com base nas APIs.
+4. Revise os textos e clique em **Enviar Check-in**!
+5. **Autenticação automática**: A extensão lê a sessão ativa diretamente do seu navegador, dispensando qualquer configuração de arquivo `cookies.txt`.
+
+---
+
+## 🐚 Opção 2: CLI principal (`checkin.sh`)
+
+Permite a automação total via terminal ou tarefas agendadas (Cron).
+
+### ⚙️ Configuração Única (Autenticação do Lab):
+O CLI autentica utilizando o cookie `remember_web_*` do Laravel.
+
+1. Faça login em `https://lab.idealtrends.io` no navegador.
+2. Abra o DevTools (F12) → **Application/Storage** → **Cookies** → `https://lab.idealtrends.io`.
+3. Copie o nome completo do cookie `remember_web_*` e seu valor.
 4. Copie o template e preencha:
-
    ```bash
    cp cookies.txt.example cookies.txt
-   # edite cookies.txt e substitua NOME_DO_COOKIE e VALOR_DO_COOKIE
+   # Edite cookies.txt e substitua NOME_DO_COOKIE e VALOR_DO_COOKIE
    chmod 600 cookies.txt
    ```
-
-   O formato é Netscape, **separado por TAB** (cuidado para o editor não converter em espaços):
-
-   ```
-   # Netscape HTTP Cookie File
-   lab.idealtrends.io	FALSE	/	TRUE	2082758400	remember_web_XXXX	VALOR
-   ```
-
-5. Teste:
-
+5. Teste o status:
    ```bash
    ./checkin.sh status
    ```
 
-   Saída esperada: seu nome, a data de hoje e um card por iniciativa (`[OK]` enviado / `[--]` pendente).
+### ⚙️ Configuração do Jira / Bitbucket / Gemini:
+1. Crie o arquivo de configurações:
+   ```bash
+   cp config.json.example config.json
+   ```
+2. Abra o `config.json` e insira suas credenciais:
+   - **Jira**: Insira a URL, seu e-mail e seu API Token do Atlassian.
+   - **Bitbucket**: Insira seu Workspace, o repositório, o seu nome de usuário (para filtro) e o API Token da Atlassian (com a permissão `Repositories: Read`).
+   - **Gemini**: Insira sua chave de API gerada no Google AI Studio.
 
-A cada execução o script faz um GET na página para renovar a sessão (`ceo_vision_ia_session`)
-e obter um `XSRF-TOKEN` fresco — ambos são gravados de volta no `cookies.txt` automaticamente.
-Você só precisa renovar o `remember_web` manualmente se ele expirar ou se fizer logout no navegador.
+### 🚀 Uso da CLI:
 
-## Uso
-
+#### Modo Automático (Consulta APIs + IA):
+O subcomando `auto` coleta seus dados das APIs, resume usando IA e realiza a postagem:
 ```bash
-# Ver o estado dos check-ins de hoje
-./checkin.sh status
+# Simula a geração automática sem postar (mostra o preview)
+./checkin.sh auto --initiative 17 --dry-run
 
-# Enviar (ou atualizar) o check-in do dia
-./checkin.sh submit \
-  --yesterday "O que foi feito no último dia útil" \
-  --today "O que será feito hoje" \
-  [--confidence N]        # 1-5, padrão 5
-  [--blockers "TEXTO"]    # padrão "Nenhum"
-  [--artifact URL]        # URL de PR/artefato, padrão vazio
-  [--initiative ID]       # padrão 6 = Auditoria Ideal
-  [--date YYYY-MM-DD]     # padrão hoje
+# Executa e envia de verdade
+./checkin.sh auto --initiative 6
 ```
 
-O POST faz **upsert**: reenviar no mesmo dia atualiza o registro existente, não duplica.
-Sucesso = HTTP 302 (redirect padrão do Inertia).
+* **Inteligência de Feriados**: O modo automático ignora finais de semana e feriados (incluindo cálculo dinâmico de feriados móveis como Carnaval, Sexta-feira Santa e Corpus Christi, além de feriados federais e de SP). 
+* **Ontem Vazio**: Se o dia anterior foi um feriado ou fim de semana, a seção `ONTEM` será automaticamente enviada em branco.
+* **Sem Duplicidade**: Se o check-in do dia já foi preenchido, o script pula a execução para evitar sobrescrever dados manuais.
 
-## Solução de problemas
-
-| Sintoma | Causa provável | Correção |
-|---|---|---|
-| `ERRO: nao consegui obter XSRF-TOKEN` | Sessão/cookie expirado | Renove o `remember_web` no navegador e atualize o `cookies.txt` (passos 1–4) |
-| `curl` falha no GET (exit != 0) | Cookie inválido ou sem rede | Idem acima; confira conectividade com o Lab |
-| `POST retornou HTTP 419` | CSRF rejeitado | Rode de novo (o GET renova o token); persiste → renovar cookie |
-| `POST retornou HTTP 422` | Payload inválido | Confira os campos obrigatórios `--yesterday` e `--today` |
-| Status mostra `[--]` após envio | Enviou para outra iniciativa/data | Confira `--initiative` e `--date` |
-
-## Complemento: rotina agendada na nuvem (opcional)
-
-Além do uso manual, existe uma **rotina do Claude Code** (claude.ai/code → Routines) que roda
-em dias úteis às 10h (BRT) e preenche o check-in sozinha: pula feriados de SP, sai sem alterar
-nada se o dia já foi preenchido manualmente, coleta a atividade real (commits/PRs no Bitbucket +
-tasks no Jira) e compõe os textos no estilo do usuário, sem citar códigos de task.
-
-Pontos de atenção ao replicar essa rotina:
-
-- **Egress**: o sandbox das rotinas bloqueia domínios fora do allowlist. Crie/edite o environment
-  com *Network access = Custom* liberando `lab.idealtrends.io`, `brasilapi.com.br`,
-  `api.bitbucket.org` e `bitbucket.org` (config apenas pela UI, no ícone do environment).
-- **Credenciais**: o cookie `remember_web` e o API token Atlassian (para a API do Bitbucket)
-  ficam embutidos no prompt da rotina. Se trocar o token ou renovar o cookie, atualize o prompt.
-- **Conectores MCP**: a rotina usa os conectores *Atlassian* e *Ideal Lab* do claude.ai
-  (o tráfego MCP não passa pelo proxy de egress).
+#### Modo Manual (Envio Direto):
+```bash
+./checkin.sh submit \
+  --yesterday "Implementei a tela de relatórios" \
+  --today "Ajustes de bugs e deploy" \
+  --confidence 5 \
+  --initiative 6
+```
