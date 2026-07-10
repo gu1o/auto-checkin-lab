@@ -1,0 +1,17 @@
+{
+  "jira": {
+    "url": "https://your-domain.atlassian.net",
+    "email": "your-email@company.com",
+    "api_token": "your-jira-api-token"
+  },
+  "bitbucket": {
+    "api_token": "your-bitbucket-api-token-or-empty-if-using-app-password",
+    "username": "your-bitbucket-username-or-empty-if-using-api-token",
+    "app_password": "your-bitbucket-app-password-or-empty-if-using-api-token",
+    "workspace": "your-workspace-id",
+    "repositories": []
+  },
+  "gemini": {
+    "api_key": ""
+  }
+}

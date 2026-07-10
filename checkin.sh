@@ -21,6 +21,9 @@
 #         --artifact URL      (padrao: vazio)
 #         --initiative ID     (padrao: 6 = Auditoria Ideal)
 #         --date YYYY-MM-DD   (padrao: hoje)
+#
+#   ./checkin.sh auto [--initiative ID] [--dry-run]
+#       Preenche o check-in automaticamente buscando atividades do Jira/Bitbucket.
 
 set -euo pipefail
 
@@ -66,6 +69,76 @@ for c in p["cards"]:
 '
 }
 
+is_submitted() {
+    local init_id="${1:-6}"
+    page_props | python3 -c '
+import json, sys
+p = json.load(sys.stdin)["props"]
+for c in p["cards"]:
+    if c["initiativeId"] == int(sys.argv[1]) and c.get("existing"):
+        sys.exit(0)
+sys.exit(1)
+' "$init_id"
+}
+
+is_holiday() {
+    python3 -c "
+import sys, datetime
+sys.path.append('$DIR')
+import auto_activity
+today = datetime.date.today()
+sys.exit(0 if auto_activity.is_holiday(today) else 1)
+"
+}
+
+cmd_auto() {
+    local initiative=6 dry_run=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --initiative) initiative="$2"; shift 2 ;;
+            --dry-run)    dry_run=true;     shift ;;
+            *) echo "ERRO: opcao desconhecida: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    # 1. Ignora fim de semana
+    local dow; dow="$(date +%u)"
+    if [ "$dow" -eq 6 ] || [ "$dow" -eq 7 ]; then
+        echo "Hoje e fim de semana. Pulando check-in."
+        return 0
+    fi
+
+    # 2. Ignora feriado
+    if is_holiday; then
+        echo "Hoje e feriado. Pulando check-in."
+        return 0
+    fi
+
+    # 3. Ignora se ja foi preenchido
+    if is_submitted "$initiative"; then
+        echo "Check-in para iniciativa $initiative ja preenchido hoje. Pulando."
+        return 0
+    fi
+
+    # 4. Coleta atividade
+    local json_output; json_output="$(python3 "$DIR/auto_activity.py")"
+    local yesterday; yesterday="$(echo "$json_output" | python3 -c 'import sys, json; print(json.load(sys.stdin)["yesterday"])')"
+    local today; today="$(echo "$json_output" | python3 -c 'import sys, json; print(json.load(sys.stdin)["today"])')"
+
+    if [ "$dry_run" = "true" ]; then
+        echo "=== DRY RUN (Iniciativa $initiative) ==="
+        echo "ONTEM (Yesterday):"
+        echo "$yesterday"
+        echo "------------------"
+        echo "HOJE (Today):"
+        echo "$today"
+        return 0
+    fi
+
+    # 5. Envia
+    cmd_submit --yesterday "$yesterday" --today "$today" --initiative "$initiative"
+}
+
 cmd_submit() {
     local yesterday="" today="" confidence=5 blockers="Nenhum" artifact="" initiative=6 date=""
     date="$(date +%F)"
@@ -92,6 +165,9 @@ cmd_submit() {
     payload="$(python3 - "$initiative" "$date" "$yesterday" "$artifact" "$today" "$confidence" "$blockers" <<'PY'
 import json, sys
 a = sys.argv
+blockers_text = a[7]
+if blockers_text.strip().lower() == "nenhum":
+    blockers_text = ""
 print(json.dumps({
     "initiative_id": int(a[1]),
     "checkin_date": a[2],
@@ -99,7 +175,7 @@ print(json.dumps({
     "yesterday_artifact_url": a[4],
     "today_text": a[5],
     "confidence_score": int(a[6]),
-    "blockers_text": a[7],
+    "blockers_text": blockers_text,
 }))
 PY
 )"
@@ -132,5 +208,6 @@ PY
 case "${1:-}" in
     status) shift; cmd_status "$@" ;;
     submit) shift; cmd_submit "$@" ;;
+    auto)   shift; cmd_auto "$@" ;;
     *) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -25; exit 1 ;;
 esac
