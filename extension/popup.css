@@ -333,6 +333,14 @@ textarea.form-control {
   margin-top: 10px;
 }
 
+.test-status {
+  margin-left: 8px;
+  font-size: 11px;
+  vertical-align: middle;
+}
+.test-status.success { color: var(--success); }
+.test-status.error   { color: var(--error); }
+
 /* Spinners */
 .spinner {
   width: 14px;

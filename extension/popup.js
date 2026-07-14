@@ -129,6 +129,54 @@ async function checkSession() {
   }
 }
 
+// Load existing check-in for today (pre-fill form if already submitted)
+async function loadExistingCheckin() {
+  try {
+    const response = await fetch('https://lab.idealtrends.io/saude-entrega/daily');
+    if (!response.ok) return;
+
+    const html = await response.text();
+    const match = html.match(/data-page="([^"]*)"/);
+    if (!match) return;
+
+    const decoded = match[1]
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+
+    const pageData = JSON.parse(decoded);
+    const cards = pageData.props?.cards || [];
+
+    for (const card of cards) {
+      const existing = card.existing;
+      if (existing && card.initiativeId) {
+        document.getElementById('checkin-initiative').value = String(card.initiativeId);
+        if (existing.confidenceScore) {
+          document.getElementById('checkin-confidence').value = String(existing.confidenceScore);
+        }
+        if (existing.yesterdayText) {
+          document.getElementById('checkin-yesterday').value = existing.yesterdayText;
+        }
+        if (existing.todayText) {
+          document.getElementById('checkin-today').value = existing.todayText;
+        }
+        if (existing.blockersText) {
+          document.getElementById('checkin-blockers').value = existing.blockersText;
+        }
+        if (existing.yesterdayArtifactUrl) {
+          document.getElementById('checkin-artifact').value = existing.yesterdayArtifactUrl;
+        }
+        showToast('Check-in de hoje já existe. Campos preenchidos com os dados atuais.', 'success');
+        return;
+      }
+    }
+  } catch (err) {
+    console.log('Could not load existing check-in:', err.message);
+  }
+}
+
 // Save Settings
 document.getElementById('config-form').addEventListener('submit', (e) => {
   e.preventDefault();
@@ -140,7 +188,9 @@ document.getElementById('config-form').addEventListener('submit', (e) => {
     bbUsername: document.getElementById('bb-username').value.trim(),
     bbWorkspace: document.getElementById('bb-workspace').value.trim(),
     bbRepos: document.getElementById('bb-repos').value.trim(),
-    geminiKey: document.getElementById('gemini-key').value.trim()
+    geminiKey: document.getElementById('gemini-key').value.trim(),
+    tgToken: document.getElementById('tg-token').value.trim(),
+    tgChatId: document.getElementById('tg-chat-id').value.trim()
   };
   
   chrome.storage.local.set({ config }, () => {
@@ -148,6 +198,111 @@ document.getElementById('config-form').addEventListener('submit', (e) => {
     // Switch to check-in tab
     document.querySelector('[data-tab="checkin-tab"]').click();
   });
+});
+
+// Test Telegram
+document.getElementById('btn-test-telegram').addEventListener('click', async () => {
+  const token = document.getElementById('tg-token').value.trim();
+  const chatId = document.getElementById('tg-chat-id').value.trim();
+  const statusEl = document.getElementById('tg-test-status');
+
+  if (!token || !chatId) {
+    statusEl.textContent = 'Preencha token e chat ID primeiro.';
+    statusEl.className = 'test-status error';
+    return;
+  }
+
+  statusEl.textContent = 'Enviando...';
+  statusEl.className = 'test-status';
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: '✅ Teste de notificação do Ideal Lab Check-in funcionando!',
+        parse_mode: 'Markdown'
+      })
+    });
+
+    const data = await res.json();
+    if (data.ok) {
+      statusEl.textContent = 'OK! Mensagem enviada.';
+      statusEl.className = 'test-status success';
+    } else {
+      statusEl.textContent = 'Erro: ' + (data.description || 'resposta inválida');
+      statusEl.className = 'test-status error';
+    }
+  } catch (err) {
+    statusEl.textContent = 'Erro: ' + err.message;
+    statusEl.className = 'test-status error';
+  }
+});
+
+// Simulate pending check-in notification
+document.getElementById('btn-test-notify').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-test-notify');
+  btn.disabled = true;
+  showToast('Simulando verificação do check-in...');
+  try {
+    const cfg = (await chrome.storage.local.get(['config'])).config;
+    if (!cfg?.tgToken || !cfg?.tgChatId) {
+      showToast('Configure o Telegram primeiro.', 'error');
+      btn.disabled = false;
+      return;
+    }
+
+    const response = await fetch('https://lab.idealtrends.io/saude-entrega/daily', { credentials: 'include' });
+    if (!response.ok) {
+      showToast('Falha ao acessar Ideal Lab (sessão expirada?).', 'error');
+      btn.disabled = false;
+      return;
+    }
+
+    const html = await response.text();
+    const match = html.match(/data-page="([^"]*)"/);
+    if (!match) {
+      showToast('Não foi possível ler os dados da página.', 'error');
+      btn.disabled = false;
+      return;
+    }
+
+    const decoded = match[1]
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+    const pageData = JSON.parse(decoded);
+    const cards = pageData.props?.cards || [];
+    const hasCheckin = cards.some(card => card.existing);
+    const dateStr = new Date().toLocaleDateString('pt-BR');
+
+    if (hasCheckin) {
+      showToast('Check-in já preenchido hoje. Enviando simulação mesmo assim...');
+    }
+
+    const msg = hasCheckin
+      ? `⚠️ *SIMULAÇÃO - Check-in já preenchido*\n\nO check-in de *${dateStr}* foi simulado como pendente para teste.\n\n(Notificação real só é enviada se estiver pendente às 11h.)`
+      : `⚠️ *Check-in pendente!*\n\nO check-in de *${dateStr}* ainda não foi preenchido no Ideal Lab.\n\nAcesse a extensão para preencher.`;
+
+    const res = await fetch(`https://api.telegram.org/bot${cfg.tgToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: cfg.tgChatId, text: msg, parse_mode: 'Markdown' })
+    });
+
+    const data = await res.json();
+    if (data.ok) {
+      showToast('Notificação de pendência enviada via Telegram!');
+    } else {
+      showToast('Erro Telegram: ' + (data.description || 'desconhecido'), 'error');
+    }
+  } catch (err) {
+    showToast('Erro: ' + err.message, 'error');
+  }
+  btn.disabled = false;
 });
 
 // Load Settings
@@ -163,6 +318,8 @@ function loadConfig() {
       document.getElementById('bb-workspace').value = cfg.bbWorkspace || '';
       document.getElementById('bb-repos').value = cfg.bbRepos || '';
       document.getElementById('gemini-key').value = cfg.geminiKey || '';
+      document.getElementById('tg-token').value = cfg.tgToken || '';
+      document.getElementById('tg-chat-id').value = cfg.tgChatId || '';
     }
   });
 }
@@ -467,7 +624,9 @@ document.getElementById('btn-submit').addEventListener('click', async () => {
     
     if (postRes.status === 200 || postRes.status === 302 || postRes.status === 303) {
       showToast('Check-in enviado com sucesso!');
-      checkSession(); // refresh
+      checkSession();
+      loadExistingCheckin();
+      chrome.runtime.sendMessage({ type: 'refreshBadge' });
     } else {
       throw new Error('POST retornou status HTTP ' + postRes.status);
     }
@@ -481,5 +640,6 @@ document.getElementById('btn-submit').addEventListener('click', async () => {
 // Init
 document.addEventListener('DOMContentLoaded', () => {
   loadConfig();
-  checkSession();
+  checkSession().then(() => loadExistingCheckin());
+  chrome.runtime.sendMessage({ type: 'refreshBadge' });
 });

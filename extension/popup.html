@@ -141,6 +141,24 @@
             </div>
           </div>
 
+          <!-- Telegram Settings -->
+          <div class="section-card">
+            <h4>Telegram (notificação se check-in estiver pendente às 11h)</h4>
+            <div class="form-group row">
+              <div class="col">
+                <label for="tg-token">Bot Token</label>
+                <input type="password" id="tg-token" class="form-control" placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
+              </div>
+              <div class="col">
+                <label for="tg-chat-id">Chat ID</label>
+                <input type="text" id="tg-chat-id" class="form-control" placeholder="-1001234567890">
+              </div>
+            </div>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-test-telegram">Testar</button>
+            <span id="tg-test-status" class="test-status"></span>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-test-notify" style="margin-left:6px">Simular pendência</button>
+          </div>
+
           <button type="submit" class="btn btn-primary btn-block">Salvar Configurações</button>
         </form>
       </section>
