@@ -13,5 +13,10 @@
   },
   "gemini": {
     "api_key": ""
+  },
+  "telegram": {
+    "bot_token": "",
+    "chat_id": "",
+    "webhook_secret": ""
   }
 }

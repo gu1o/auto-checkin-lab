@@ -25,15 +25,53 @@
 #   ./checkin.sh auto [--initiative ID] [--dry-run]
 #       Preenche o check-in automaticamente buscando atividades do Jira/Bitbucket.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 BASE_URL="https://lab.idealtrends.io"
 ENDPOINT="$BASE_URL/saude-entrega/daily"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JAR="$DIR/cookies.txt"
+CONFIG="$DIR/config.json"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
 [ -f "$JAR" ] || { echo "ERRO: $JAR nao existe (cookie remember_web necessario)" >&2; exit 1; }
+
+notify() {
+    # Envia mensagem pro Telegram se telegram.bot_token/chat_id estiverem no
+    # config.json; sem configuracao, nao faz nada (fluxo dos demais devs intacto).
+    local text="$1" creds token chat_id
+    [ -f "$CONFIG" ] || return 0
+    creds="$(python3 -c '
+import json, sys
+try:
+    t = json.load(open(sys.argv[1])).get("telegram", {})
+    tok, chat = t.get("bot_token", ""), str(t.get("chat_id", ""))
+    if tok and chat:
+        print(tok)
+        print(chat)
+except Exception:
+    pass
+' "$CONFIG")" || return 0
+    [ -n "$creds" ] || return 0
+    token="$(sed -n 1p <<<"$creds")"
+    chat_id="$(sed -n 2p <<<"$creds")"
+    curl -s -o /dev/null --max-time 10 \
+        "https://api.telegram.org/bot${token}/sendMessage" \
+        -d chat_id="${chat_id}" \
+        --data-urlencode text="$text" || true
+}
+
+# Notifica falhas do modo auto (o alerta mais valioso: cookie remember_web
+# expirado faria a cron falhar calada). Ativado apenas dentro de cmd_auto.
+NOTIFY_ON_ERR=false
+on_err() {
+    local code=$?
+    [ "$NOTIFY_ON_ERR" = "true" ] || return 0
+    NOTIFY_ON_ERR=false
+    notify "❌ lab-checkin: falha no check-in automatico (exit $code, $(date '+%F %H:%M')).
+Causa comum: cookie remember_web expirado. Verifique o auto.log."
+}
+trap on_err ERR
 
 refresh_session() {
     # GET renova ceo_vision_ia_session + XSRF-TOKEN no cookie jar e devolve o HTML
@@ -101,6 +139,8 @@ cmd_auto() {
         esac
     done
 
+    NOTIFY_ON_ERR=true
+
     # 1. Ignora fim de semana
     local dow; dow="$(date +%u)"
     if [ "$dow" -eq 6 ] || [ "$dow" -eq 7 ]; then
@@ -137,6 +177,15 @@ cmd_auto() {
 
     # 5. Envia
     cmd_submit --yesterday "$yesterday" --today "$today" --initiative "$initiative"
+
+    NOTIFY_ON_ERR=false
+    notify "✅ Check-in enviado — iniciativa $initiative ($(date +%F))
+
+Ontem:
+$yesterday
+
+Hoje:
+$today"
 }
 
 cmd_submit() {

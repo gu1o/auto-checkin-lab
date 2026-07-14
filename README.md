@@ -13,6 +13,10 @@ Script e Extensão do Chrome para preencher e auditar o check-in diário de **Sa
 | `config.json.example` | Template de configuração para as integrações do Jira, Bitbucket e Gemini |
 | `extension/` | Código fonte da Extensão do Chrome (Interface Gráfica com Auditoria) |
 | `cookies.txt.example` | Template do cookie jar para uso exclusivo via CLI |
+| `worker/` | Cloudflare Worker do bot do Telegram (@CheckInLabBot): comandos `/pular`, `/retomar`, `/pulos` via webhook |
+| `telegram_poller.py` | Alternativa local ao worker (long-polling via systemd) — desativado enquanto o webhook estiver ativo |
+| `docs/telegram-integration.md` | Arquitetura da integração com o Telegram (notificações + bot) |
+| `docs/plano-compartilhamento.md` | Plano para abrir a automação para o time (multi-usuário, extensão como hub, motor Gemini/Claude, modo automático) |
 
 ---
 
@@ -65,6 +69,7 @@ O CLI autentica utilizando o cookie `remember_web_*` do Laravel.
    - **Jira**: Insira a URL, seu e-mail e seu API Token do Atlassian.
    - **Bitbucket**: Insira seu Workspace, o repositório, o seu nome de usuário (para filtro) e o API Token da Atlassian (com a permissão `Repositories: Read`).
    - **Gemini**: Insira sua chave de API gerada no Google AI Studio.
+   - **Telegram** (opcional): bot token (via @BotFather) e chat ID para receber notificações do modo `auto` — ✅ quando o check-in for enviado (com o resumo gerado) e ❌ quando falhar (ex.: cookie `remember_web` expirado). Deixe em branco para desativar; os pulos (fim de semana, feriado, já preenchido) não notificam. Detalhes em `docs/telegram-integration.md`.
 
 ### 🚀 Uso da CLI:
 

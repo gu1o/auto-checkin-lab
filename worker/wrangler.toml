@@ -1,0 +1,7 @@
+name = "lab-checkin-bot"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+# Secrets (definir com `wrangler secret put`): BOT_TOKEN, WEBHOOK_SECRET
+[vars]
+CHAT_ID = "140674932"
