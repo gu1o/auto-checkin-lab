@@ -2,6 +2,8 @@
 
 Script e Extensão do Chrome para preencher e auditar o check-in diário de **Saúde da Entrega** no Ideal Lab (`https://lab.idealtrends.io/saude-entrega/daily`).
 
+> **É novo por aqui?** Comece pelo **[guia de setup para devs](docs/guia-setup-dev.md)** — ele compara os três modos de usar (extensão, rotina no Claude Code ou CLI+cron), lista as credenciais necessárias e traz o passo a passo de cada um. A escolha do modo é sua.
+
 ---
 
 ## 📂 Estrutura de Arquivos
@@ -17,6 +19,8 @@ Script e Extensão do Chrome para preencher e auditar o check-in diário de **Sa
 | `telegram_poller.py` | Alternativa local ao worker (long-polling via systemd) — desativado enquanto o webhook estiver ativo |
 | `docs/telegram-integration.md` | Arquitetura da integração com o Telegram (notificações + bot) |
 | `docs/plano-compartilhamento.md` | Plano para abrir a automação para o time (multi-usuário, extensão como hub, motor Gemini/Claude, modo automático) |
+| `docs/plano-rollout-time.md` | Escopo consolidado do rollout para o time: skill `/setup-checkin`, tool MCP `submit-daily-checkin` no Lab, `project_key` do Bitbucket, roteamento multi-iniciativa e canais de notificação |
+| `docs/guia-setup-dev.md` | **Guia de setup para o dev**: tabela de decisão entre os modos (extensão / rotina Claude Code / CLI), credenciais, prompt template da rotina e troubleshooting |
 
 ---
 
