@@ -10,6 +10,7 @@ Script e Extensão do Chrome para preencher e auditar o check-in diário de **Sa
 
 | Arquivo/Diretório | Descrição |
 |---|---|
+| `.claude/skills/setup-checkin/` | Skill do Claude Code: rode `/setup-checkin` na pasta do repo para configurar o check-in automático guiado (importa o export da extensão, valida credenciais e cria a rotina agendada na sua conta) |
 | `checkin.sh` | CLI principal (subcomandos `status`, `submit` e `auto`) |
 | `auto_activity.py` | Script auxiliar que busca tarefas no Jira, commits no Bitbucket e sintetiza textos usando Gemini |
 | `config.json.example` | Template de configuração para as integrações do Jira, Bitbucket, Gemini/Claude e Telegram |

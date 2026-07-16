@@ -25,24 +25,22 @@
 - Botão **🧪 Testar credenciais** na página pós-salvar do `/config`.
 - Botão de teste do Telegram na extensão (valida token + chat_id digitados).
 
-## Fase 1 — Tool `submit-daily-checkin` no MCP do Ideal Lab
+## Fase 1 — ~~Tool `submit-daily-checkin` no MCP do Ideal Lab~~ (descartada)
 
-**Onde:** repositório da plataforma Lab (não neste repo).
-**Por quê primeiro:** elimina o cookie `remember_web` — a credencial mais
-frágil (expira, falha silenciosa nº 1) — e destrava o cenário zero-credencial
-da Fase 2.
+**Decisão (2026-07-16): não haverá mudanças na plataforma Lab.** O envio
+continua pelo fluxo HTTP com o cookie `remember_web` (comprovado pela rotina
+em produção). Para atacar a dor real do cookie — a coleta manual no DevTools —
+a fase foi substituída por:
 
-- Tool de escrita com os campos do form: `initiative_id`, `yesterday_text`,
-  `today_text`, `confidence_score`, `blockers_text`, `artifact_url`,
-  `checkin_date` (default hoje). Mesmas validações/auditoria do app web;
-  upsert como o POST atual; exige token com escopo read-write.
-- Tool (ou extensão de uma existente) para as guardas: consultar se o check-in
-  do dia já foi preenchido e listar as iniciativas vinculadas do usuário.
+- **Captura automática do cookie no export da extensão** ✅ *(implementada)*:
+  o "Exportar config.json" lê o `remember_web` da sessão viva do navegador e
+  inclui em `lab.cookie_name/cookie_value`. O dev loga no Lab e exporta —
+  DevTools sai do fluxo. Renovação = relogar + re-exportar + rodar a skill.
 
-## Fase 2 — Skill `/setup-checkin`
+## Fase 2 — Skill `/setup-checkin` ✅ *(implementada em 2026-07-16)*
 
-**Onde:** este repo (`.claude/skills/setup-checkin/`). O dev clona, abre o
-Claude Code e roda a skill.
+**Onde:** este repo (`.claude/skills/setup-checkin/SKILL.md`). O dev clona,
+abre o Claude Code e roda a skill.
 
 Fluxo da skill:
 
@@ -50,21 +48,21 @@ Fluxo da skill:
    notificação** (Telegram / e-mail / navegador / nenhum).
 2. Registro no bot (se Telegram): `/start` no @CheckInLabBot → aprovação do
    admin → chat_id.
-3. **Credenciais, dois cenários:**
-   - **A — importar da extensão:** o dev preenche o form visual da extensão
-     (que já valida com os botões de teste) e usa **Exportar config.json**; a
-     skill detecta o arquivo e não pede nada de novo.
-   - **B — MCPs (preferido pós-Fase 1):** Atlassian MCP cobre o Jira (sem
-     token); Ideal Lab MCP cobre o check-in (sem cookie). Bitbucket não é
-     coberto pelo conector Atlassian → token `ATATT` ou resumo só do Jira.
+3. **Credenciais — via export da extensão:** o dev preenche o form visual da
+   extensão (que valida com os botões de teste) e usa **Exportar config.json**
+   (já com o cookie do Lab embutido); a skill detecta o arquivo e não pede
+   nada de novo. *Nota:* o Atlassian MCP pode dispensar o token do Jira para
+   quem tem o conector — açúcar opcional, não pilar (o cenário zero-credencial
+   caiu junto com a Fase 1).
 4. **Teste de validação** antes de agendar (mesmos checks do `/testar`).
 5. Cria a **rotina agendada** via `/schedule` com o prompt template do
    check-in (guardas → coleta → geração → envio → notificação).
 6. Instrui o passo manual: allowlist de egress do environment da rotina
    (api.telegram.org, lab.idealtrends.io, Atlassian) — só via UI do claude.ai.
 
-**Entregáveis:** `SKILL.md` + template do prompt da rotina + seção no README.
-A skill pode ser lançada só com o cenário A antes da Fase 1 ficar pronta.
+**Entregáveis:** `SKILL.md` (com template do prompt da rotina embutido, já
+suportando roteamento multi-iniciativa via `initiative_config` do export) +
+seção no README/guia.
 
 ## Fase 3 — `project_key` no Bitbucket + paginação
 
@@ -123,14 +121,14 @@ da rotina.
 ## Dependências e ordem
 
 ```
-F1 (MCP Lab) ──────────┐
-                       ├──> F2 cenário B (zero-credencial)
-F2 cenário A ──────────┘         │
-F3 (project_key) ──> F4 (multi-iniciativa) ──> F4b (mapeamento via bot)
+F1 descartada (cookie no export ✅ substitui)
+F2 skill ✅ ──> piloto com devs
+F3 (project_key) ──> F4 no script/extensão (multi-iniciativa) ──> F4b (mapeamento via bot)
 F5a (independente)   F5b (após adoção, se necessário)
 ```
 
-- F1 corre em paralelo no repo do Lab; F2 pode lançar antes só com cenário A.
+- A rotina criada pela skill **já roteia multi-iniciativa** (é lógica de
+  prompt); F4 permanece para os runners script/extensão.
 - F3 antes de F4 (o roteamento reusa o filtro por project).
 - **Rollout:** piloto com 1–2 devs (incluindo o que já testou o Telegram) →
   ajustes → anúncio para o time com a skill como porta de entrada.
