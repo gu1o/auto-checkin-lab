@@ -41,7 +41,7 @@ do navegador — estão no roadmap: `docs/plano-rollout-time.md`.)
 | **Jira API token** | id.atlassian.com → Security → API tokens | Todos os modos |
 | **Bitbucket API token** (permissão `Repositories: Read`) | id.atlassian.com → Security → API tokens | Todos os modos |
 | **Key de IA** — Gemini (free tier) ou Anthropic | Google AI Studio / Console da Anthropic | Extensão e CLI (a rotina do Claude Code gera o texto sozinha, sem key) |
-| **Cookie `remember_web`** do Lab | DevTools (F12) em lab.idealtrends.io → Application → Cookies | Só modos B e C (a extensão lê a sessão do navegador) |
+| **Cookie `remember_web`** do Lab | **Automático**: logado no Lab, o "Exportar config.json" da extensão captura o cookie sozinho (sem DevTools) | Só modos B e C (a extensão lê a sessão do navegador) |
 
 > ⚠️ Sobre a key da Anthropic: a assinatura corporativa do claude.ai **não**
 > gera API key — key é do Console (platform.claude.com, cobrança separada).
@@ -65,21 +65,25 @@ do navegador — estão no roadmap: `docs/plano-rollout-time.md`.)
    sozinho no horário configurado (Chrome precisa estar aberto; sessão
    expirada gera aviso ❌ no Telegram).
 6. (Opcional) **Exportar config.json** — gera o arquivo pronto para os modos
-   B e C, para você não redigitar nada.
+   B e C, para você não redigitar nada. Estando logado no Lab, o cookie
+   `remember_web` é incluído automaticamente no export.
 
 ## Modo B — Rotina agendada no Claude Code (conta corporativa)
 
 A rotina roda na nuvem do claude.ai, **no seu assento** — não consome a conta
 de ninguém e não precisa de máquina ligada.
 
-> 🔜 Este modo será automatizado por uma skill (`/setup-checkin`) que fará os
-> passos abaixo por você — veja `docs/plano-rollout-time.md` (Fase 2). Até lá,
-> o caminho manual:
+> ✅ **Este modo tem setup guiado**: abra o Claude Code na pasta do repo e
+> rode **`/setup-checkin`** — a skill importa o config.json exportado pela
+> extensão, valida todas as credenciais, monta a rotina (inclusive com
+> roteamento multi-iniciativa, se você configurou o mapa na extensão) e te
+> orienta nos passos manuais. Os passos abaixo documentam o que ela faz, caso
+> prefira o caminho manual:
 
-1. **Credenciais em mãos**: o jeito mais fácil é preencher tudo na extensão e
-   usar **Exportar config.json** (Modo A, passo 6). Senão, copie
-   `config.json.example` e preencha. Você também precisa do cookie
-   `remember_web` (Passo 0.2).
+1. **Credenciais em mãos**: preencha tudo na extensão e use **Exportar
+   config.json** (Modo A, passo 6) — o cookie do Lab já vem incluído. Senão,
+   copie `config.json.example` e preencha (aí sim o cookie sai do DevTools,
+   Passo 0.2).
 2. **Criar a rotina**: no Claude Code, rode `/schedule` e crie uma rotina
    diária (ex.: 09:30, seg–sex) com um prompt que siga este roteiro:
 
@@ -126,9 +130,10 @@ de ninguém e não precisa de máquina ligada.
    guardadas no `/config` a qualquer momento.
 
 > 💡 Conectores: se você tiver o **Atlassian MCP** conectado na sua conta, a
-> rotina pode ler o Jira por ele (dispensa o token). O envio ao Lab ainda
-> exige o cookie — até a tool `submit-daily-checkin` entrar no MCP do Ideal
-> Lab (Fase 1 do plano), quando o cookie sai do fluxo.
+> rotina pode ler o Jira por ele (dispensa o token). O envio ao Lab usa o
+> cookie `remember_web` — que o export da extensão captura sozinho; quando
+> expirar (❌ no Telegram), logue no Lab, re-exporte e rode `/setup-checkin`
+> de novo.
 
 ## Modo C — CLI + cron local
 
@@ -143,7 +148,7 @@ automático respeita as mesmas guardas dos outros modos.
 
 | Sintoma | Causa provável | Correção |
 |---|---|---|
-| `/testar` mostra ❌ Ideal Lab | Cookie `remember_web` expirado | Renovar o cookie (login no Lab → DevTools) e atualizar via `/config` / config.json / relogar no navegador |
+| `/testar` mostra ❌ Ideal Lab | Cookie `remember_web` expirado | Logar no Lab no navegador → **Exportar config.json** na extensão (cookie novo incluído) → rodar `/setup-checkin` ou atualizar via `/config` |
 | ❌ Jira/Bitbucket no `/testar` | Token inválido ou sem permissão | Regerar token; Bitbucket precisa de `Repositories: Read` |
 | Rascunho vazio | Sem issues/commits no período, ou username do Bitbucket não bate com o autor dos commits | Confira o campo username / deixe vazio para auto-detectar |
 | Nada chega no Telegram | chat_id errado ou cadastro não aprovado | `/start` de novo; use o botão 🧪 da extensão para validar token+chat_id |

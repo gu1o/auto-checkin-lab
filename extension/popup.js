@@ -101,14 +101,21 @@ document.getElementById('config-form').addEventListener('submit', (e) => {
 // configura uma vez na UI, exporta, coloca na pasta do repo.
 document.getElementById('btn-export').addEventListener('click', async () => {
   const cfg = await loadConfigData();
-  const json = JSON.stringify(buildConfigJson(cfg), null, 2) + '\n';
+  // Captura o cookie remember_web da sessao viva do navegador: o export sai
+  // pronto para a rotina/CLI sem o dev abrir o DevTools.
+  const labCookie = await getRememberCookie().catch(() => null);
+  const json = JSON.stringify(buildConfigJson(cfg, labCookie), null, 2) + '\n';
   const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
   const a = document.createElement('a');
   a.href = url;
   a.download = 'config.json';
   a.click();
   URL.revokeObjectURL(url);
-  showToast('config.json exportado.');
+  if (labCookie) {
+    showToast('config.json exportado (cookie do Lab incluído).');
+  } else {
+    showToast('config.json exportado SEM o cookie do Lab — faça login em lab.idealtrends.io e exporte de novo.', 'error');
+  }
 });
 
 document.getElementById('btn-import').addEventListener('click', () => {

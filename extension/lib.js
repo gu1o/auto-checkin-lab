@@ -92,7 +92,9 @@ async function loadConfigData() {
 
 // Gera o conteudo do config.json no formato do config.json.example — a ponte
 // entre a extensao e o trilho CLI/cron (Fase 3: "Exportar config.json").
-function buildConfigJson(cfg) {
+// labCookie (opcional): cookie remember_web capturado do navegador — vai no
+// export para os modos rotina/CLI usarem sem o dev abrir o DevTools.
+function buildConfigJson(cfg, labCookie) {
   const allRepos = new Set();
   if (cfg.bbRepos) {
     cfg.bbRepos.split(',').map(r => r.trim()).filter(Boolean).forEach(r => allRepos.add(r));
@@ -122,6 +124,10 @@ function buildConfigJson(cfg) {
       bot_token: cfg.tgBotToken || '',
       chat_id: cfg.tgChatId || '',
       webhook_secret: ''
+    },
+    lab: {
+      cookie_name: labCookie?.name || '',
+      cookie_value: labCookie?.value || ''
     },
     initiative_config: cfg.initiativeConfig || {}
   };
