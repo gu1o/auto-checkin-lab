@@ -2,6 +2,17 @@ name = "lab-checkin-bot"
 main = "worker.js"
 compatibility_date = "2026-07-01"
 
-# Secrets (definir com `wrangler secret put`): BOT_TOKEN, WEBHOOK_SECRET
+# Secrets (definir com `wrangler secret put`):
+#   BOT_TOKEN      — token do @CheckInLabBot
+#   WEBHOOK_SECRET — validado no header X-Telegram-Bot-Api-Secret-Token
+#   KV_ENC_KEY     — 32 bytes em base64 (openssl rand -base64 32); criptografa
+#                    as credenciais salvas em secrets:<chat_id> no KV
 [vars]
-CHAT_ID = "140674932"
+ADMIN_CHAT_ID = "140674932"
+
+# KV com os registros de usuarios (user:<chat_id>), codigos one-time de setup
+# (setup:<codigo>, TTL 10 min) e credenciais criptografadas (secrets:<chat_id>).
+# Criar com: npx wrangler kv namespace create USERS
+[[kv_namespaces]]
+binding = "USERS"
+id = "b26bdc792dab4592b7c98758e04d07bf"

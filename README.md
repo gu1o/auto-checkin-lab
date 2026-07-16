@@ -10,10 +10,10 @@ Script e Extensão do Chrome para preencher e auditar o check-in diário de **Sa
 |---|---|
 | `checkin.sh` | CLI principal (subcomandos `status`, `submit` e `auto`) |
 | `auto_activity.py` | Script auxiliar que busca tarefas no Jira, commits no Bitbucket e sintetiza textos usando Gemini |
-| `config.json.example` | Template de configuração para as integrações do Jira, Bitbucket e Gemini |
-| `extension/` | Código fonte da Extensão do Chrome (Interface Gráfica com Auditoria) |
+| `config.json.example` | Template de configuração para as integrações do Jira, Bitbucket, Gemini/Claude e Telegram |
+| `extension/` | Código fonte da Extensão do Chrome (auditoria/envio manual + modo automático via `chrome.alarms`; `lib.js` compartilhado entre `popup.js` e `background.js`) |
 | `cookies.txt.example` | Template do cookie jar para uso exclusivo via CLI |
-| `worker/` | Cloudflare Worker do bot do Telegram (@CheckInLabBot): comandos `/pular`, `/retomar`, `/pulos` via webhook |
+| `worker/` | Cloudflare Worker do bot do Telegram (@CheckInLabBot), **multi-usuário**: auto-registro `/start` + aprovação do admin (Workers KV), `/pular`, `/retomar`, `/pulos`, `/testar` (valida as credenciais salvas contra Jira, Bitbucket, Lab e IA — somente leitura, nada é enviado ao Lab) e `/config` (formulário one-time-link para credenciais, criptografadas com AES-GCM; após salvar, a página oferece um botão **🧪 Testar credenciais**) |
 | `telegram_poller.py` | Alternativa local ao worker (long-polling via systemd) — desativado enquanto o webhook estiver ativo |
 | `docs/telegram-integration.md` | Arquitetura da integração com o Telegram (notificações + bot) |
 | `docs/plano-compartilhamento.md` | Plano para abrir a automação para o time (multi-usuário, extensão como hub, motor Gemini/Claude, modo automático) |
@@ -32,10 +32,15 @@ Esta é a opção recomendada caso você prefira **revisar e auditar** os textos
 
 ### 🚀 Como usar:
 1. Clique no ícone da extensão na barra de ferramentas do Chrome.
-2. Acesse a aba **Configurações** e preencha suas credenciais do Jira, Bitbucket e Gemini API Key. As credenciais ficam salvas de forma segura no storage local do seu próprio navegador.
+2. Acesse a aba **Configurações** e preencha suas credenciais do Jira, Bitbucket e da IA. As credenciais ficam salvas de forma segura no storage local do seu próprio navegador.
+   - **Motor de Geração (IA)**: escolha o provider — **Gemini** (free tier, default) ou **Claude** (API da Anthropic; cada dev usa a própria API key, chamada direta do browser).
+   - **Telegram** (opcional): token do bot (compartilhado no time) + seu `chat_id` (mande `/start` pro **@CheckInLabBot** — ele te responde já registrado, após aprovação do admin). Habilita notificações e o `/pular`. Use o botão **🧪 Enviar mensagem de teste** para validar o token/chat_id na hora (ou mande `/testar` no chat do bot).
+   - **Iniciativa padrão** e **horário** do modo automático.
 3. Na aba **Check-in**, selecione a iniciativa e clique em **Gerar Rascunho**. O rascunho de *Ontem* e *Hoje* será carregado automaticamente com base nas APIs.
 4. Revise os textos e clique em **Enviar Check-in**!
 5. **Autenticação automática**: A extensão lê a sessão ativa diretamente do seu navegador, dispensando qualquer configuração de arquivo `cookies.txt`.
+6. **Modo automático** (opcional): com o toggle ligado, um alarme diário (`chrome.alarms`) roda o check-in sozinho no horário configurado — mesmas guardas do CLI (fim de semana → feriado → `/pular` → já preenchido) — usando a sessão viva do navegador. Só precisa do Chrome aberto; se a sessão do Lab expirar, você é avisado no Telegram (❌).
+7. **Exportar config.json**: gera e baixa o arquivo no formato do `config.json.example` com o que está configurado na extensão — a ponte para quem também roda o CLI/cron.
 
 ---
 
@@ -84,6 +89,7 @@ O subcomando `auto` coleta seus dados das APIs, resume usando IA e realiza a pos
 ```
 
 * **Inteligência de Feriados**: O modo automático ignora finais de semana e feriados (incluindo cálculo dinâmico de feriados móveis como Carnaval, Sexta-feira Santa e Corpus Christi, além de feriados federais e de SP). 
+* **Respeita o `/pular`**: se o dia foi cancelado via `/pular` no @CheckInLabBot (mensagem fixada no chat, lida via `getChat` com o `telegram` do `config.json`), o script não preenche e avisa no Telegram (🚫). Sem Telegram configurado, a checagem é pulada; falha na chamada não bloqueia o check-in.
 * **Ontem Vazio**: Se o dia anterior foi um feriado ou fim de semana, a seção `ONTEM` será automaticamente enviada em branco.
 * **Sem Duplicidade**: Se o check-in do dia já foi preenchido, o script pula a execução para evitar sobrescrever dados manuais.
 

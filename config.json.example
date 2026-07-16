@@ -11,7 +11,11 @@
     "workspace": "your-workspace-id",
     "repositories": []
   },
+  "llm_provider": "gemini",
   "gemini": {
+    "api_key": ""
+  },
+  "anthropic": {
     "api_key": ""
   },
   "telegram": {

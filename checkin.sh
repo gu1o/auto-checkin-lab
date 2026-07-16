@@ -119,6 +119,45 @@ sys.exit(1)
 ' "$init_id"
 }
 
+is_skipped() {
+    # Respeita o /pular do bot: le a mensagem fixada do chat com o
+    # @CheckInLabBot ("SKIP: YYYY-MM-DD, ...") via getChat. Mesmo contrato do
+    # notify(): sem telegram no config.json, nao checa; falha na chamada nao
+    # bloqueia o check-in (mesma filosofia das rotinas cloud).
+    local creds token chat_id pinned today
+    [ -f "$CONFIG" ] || return 1
+    creds="$(python3 -c '
+import json, sys
+try:
+    t = json.load(open(sys.argv[1])).get("telegram", {})
+    tok, chat = t.get("bot_token", ""), str(t.get("chat_id", ""))
+    if tok and chat:
+        print(tok)
+        print(chat)
+except Exception:
+    pass
+' "$CONFIG")" || return 1
+    [ -n "$creds" ] || return 1
+    token="$(sed -n 1p <<<"$creds")"
+    chat_id="$(sed -n 2p <<<"$creds")"
+    pinned="$(curl -s --max-time 10 \
+        "https://api.telegram.org/bot${token}/getChat" \
+        -d chat_id="${chat_id}" \
+        | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin)
+    print((r.get("result") or {}).get("pinned_message", {}).get("text", ""))
+except Exception:
+    pass
+')" || return 1
+    today="$(date +%F)"
+    case "$pinned" in
+        *SKIP:*"$today"*) return 0 ;;
+    esac
+    return 1
+}
+
 is_holiday() {
     python3 -c "
 import sys, datetime
@@ -151,6 +190,13 @@ cmd_auto() {
     # 2. Ignora feriado
     if is_holiday; then
         echo "Hoje e feriado. Pulando check-in."
+        return 0
+    fi
+
+    # 2b. Ignora se o dia foi cancelado via /pular (mensagem fixada no Telegram)
+    if is_skipped; then
+        echo "Check-in de hoje cancelado via /pular (mensagem fixada no Telegram). Pulando."
+        notify "🚫 lab-checkin: check-in de hoje NAO enviado — cancelado via /pular. Para desfazer: /retomar hoje"
         return 0
     fi
 
