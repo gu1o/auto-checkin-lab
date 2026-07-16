@@ -132,16 +132,73 @@
             </div>
           </div>
 
-          <!-- Gemini Settings -->
+          <!-- LLM Settings (motor plugavel: Gemini ou Claude) -->
           <div class="section-card">
-            <h4>Gemini AI</h4>
+            <h4>Motor de Geração (IA)</h4>
             <div class="form-group">
-              <label for="gemini-key">Gemini API Key</label>
-              <input type="password" id="gemini-key" class="form-control" placeholder="Chave da API do Google AI Studio">
+              <label for="llm-provider">Provider</label>
+              <select id="llm-provider" class="form-control">
+                <option value="gemini" selected>Gemini (free tier)</option>
+                <option value="claude">Claude (API Anthropic)</option>
+              </select>
+            </div>
+            <div class="form-group row">
+              <div class="col">
+                <label for="gemini-key">Gemini API Key</label>
+                <input type="password" id="gemini-key" class="form-control" placeholder="Chave do Google AI Studio">
+              </div>
+              <div class="col">
+                <label for="anthropic-key">Anthropic API Key</label>
+                <input type="password" id="anthropic-key" class="form-control" placeholder="sk-ant-...">
+              </div>
+            </div>
+          </div>
+
+          <!-- Telegram Settings -->
+          <div class="section-card">
+            <h4>Telegram</h4>
+            <div class="form-group row">
+              <div class="col">
+                <label for="tg-bot-token">Bot Token</label>
+                <input type="password" id="tg-bot-token" class="form-control" placeholder="Token do @CheckInLabBot (compartilhado no time)">
+              </div>
+              <div class="col">
+                <label for="tg-chat-id">Seu chat_id</label>
+                <input type="text" id="tg-chat-id" class="form-control" placeholder="Mande /start pro @CheckInLabBot">
+              </div>
+            </div>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-tg-test">
+              <span class="spinner hidden" id="tg-test-spinner"></span>
+              🧪 Enviar mensagem de teste
+            </button>
+          </div>
+
+          <!-- Preferencias + Modo automatico -->
+          <div class="section-card">
+            <h4>Preferências e Automação</h4>
+            <div class="form-group row">
+              <div class="col">
+                <label for="default-initiative">Iniciativa padrão</label>
+                <select id="default-initiative" class="form-control">
+                  <option value="6">6 - Auditoria Ideal</option>
+                  <option value="17">17 - Soluções Industriais</option>
+                </select>
+              </div>
+              <div class="col">
+                <label for="auto-time">Horário do automático</label>
+                <input type="time" id="auto-time" class="form-control" value="09:30">
+              </div>
+            </div>
+            <div class="form-group">
+              <label>
+                <input type="checkbox" id="auto-enabled">
+                Modo automático (envia sozinho no horário, com Chrome aberto)
+              </label>
             </div>
           </div>
 
           <button type="submit" class="btn btn-primary btn-block">Salvar Configurações</button>
+          <button type="button" class="btn btn-secondary btn-block" id="btn-export">Exportar config.json (para o CLI/cron)</button>
         </form>
       </section>
     </main>
@@ -149,6 +206,7 @@
     <!-- Toast Notification Banner -->
     <div id="toast" class="toast hidden"></div>
   </div>
+  <script src="lib.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

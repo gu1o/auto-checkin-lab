@@ -1,18 +1,24 @@
 {
   "manifest_version": 3,
   "name": "Ideal Lab Check-in",
-  "version": "1.0.0",
-  "description": "Preenche automaticamente e audita o check-in diário no Ideal Lab usando Jira, Bitbucket e Gemini.",
+  "version": "2.0.0",
+  "description": "Preenche (manual ou automaticamente) e audita o check-in diário no Ideal Lab usando Jira, Bitbucket e IA (Gemini ou Claude).",
   "permissions": [
     "cookies",
-    "storage"
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
     "https://lab.idealtrends.io/*",
     "https://*.atlassian.net/*",
     "https://api.bitbucket.org/*",
-    "https://generativelanguage.googleapis.com/*"
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.anthropic.com/*",
+    "https://api.telegram.org/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_icon": "icon.png"
