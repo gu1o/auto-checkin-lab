@@ -22,5 +22,9 @@
     "bot_token": "",
     "chat_id": "",
     "webhook_secret": ""
+  },
+  "initiative_config": {
+    "repos": {},
+    "projects": {}
   }
 }

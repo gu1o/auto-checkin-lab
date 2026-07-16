@@ -93,6 +93,15 @@ async function loadConfigData() {
 // Gera o conteudo do config.json no formato do config.json.example — a ponte
 // entre a extensao e o trilho CLI/cron (Fase 3: "Exportar config.json").
 function buildConfigJson(cfg) {
+  const allRepos = new Set();
+  if (cfg.bbRepos) {
+    cfg.bbRepos.split(',').map(r => r.trim()).filter(Boolean).forEach(r => allRepos.add(r));
+  }
+  const initRepos = cfg.initiativeConfig?.repos || cfg.initiativeRepos || {};
+  Object.values(initRepos).forEach(v => {
+    v.split(',').map(r => r.trim()).filter(Boolean).forEach(r => allRepos.add(r));
+  });
+
   return {
     jira: {
       url: cfg.jiraUrl || '',
@@ -104,7 +113,7 @@ function buildConfigJson(cfg) {
       username: cfg.bbUsername || '',
       app_password: '',
       workspace: cfg.bbWorkspace || '',
-      repositories: cfg.bbRepos ? cfg.bbRepos.split(',').map(r => r.trim()).filter(Boolean) : []
+      repositories: [...allRepos]
     },
     llm_provider: cfg.llmProvider || 'gemini',
     gemini: { api_key: cfg.geminiKey || '' },
@@ -113,7 +122,8 @@ function buildConfigJson(cfg) {
       bot_token: cfg.tgBotToken || '',
       chat_id: cfg.tgChatId || '',
       webhook_secret: ''
-    }
+    },
+    initiative_config: cfg.initiativeConfig || {}
   };
 }
 
@@ -149,11 +159,18 @@ async function isSubmittedToday(initiativeId) {
   return cards.some(c => c.initiativeId === Number(initiativeId) && c.existing);
 }
 
+async function fetchInitiatives() {
+  const page = await fetchPageProps();
+  const cards = page.props?.cards || [];
+  return cards.map(c => ({ id: c.initiativeId, name: c.initiativeName }));
+}
+
 // --- Coleta: Jira + Bitbucket ----------------------------------------------------
 
-async function fetchJira(cfg, sinceStr) {
+async function fetchJira(cfg, sinceStr, projectKeys) {
   const url = `${cfg.jiraUrl.replace(/\/$/, '')}/rest/api/3/search/jql`;
-  const jql = `assignee = currentUser() AND updated >= "${sinceStr}"`;
+  let jql = `assignee = currentUser() AND updated >= "${sinceStr}"`;
+  if (projectKeys) jql += ` AND project IN (${projectKeys})`;
 
   const headers = {
     'Authorization': 'Basic ' + btoa(`${cfg.jiraEmail}:${cfg.jiraToken}`),
@@ -183,30 +200,24 @@ async function fetchJira(cfg, sinceStr) {
   }));
 }
 
-async function fetchBitbucket(cfg, sinceStr) {
+async function fetchBitbucket(cfg, sinceStr, reposOverride) {
   if (!cfg.bbWorkspace || (!cfg.bbToken && (!cfg.bbUsername || !cfg.bbPassword))) {
     return [];
   }
 
-  const headers = { 'Accept': 'application/json' };
-  if (cfg.bbToken) {
-    if (cfg.bbToken.startsWith('ATATT')) {
-      const email = cfg.bbUsername || cfg.jiraEmail;
-      headers['Authorization'] = 'Basic ' + btoa(`${email}:${cfg.bbToken}`);
-    } else {
-      headers['Authorization'] = `Bearer ${cfg.bbToken}`;
-    }
-  }
+  const headers = bbHeaders(cfg);
 
-  let repos = [];
-  if (cfg.bbRepos) {
-    repos = cfg.bbRepos.split(',').map(r => r.trim());
-  } else {
-    const reposUrl = `https://api.bitbucket.org/2.0/repositories/${cfg.bbWorkspace}?pagelen=100`;
-    const res = await fetch(reposUrl, { headers });
-    if (res.ok) {
-      const data = await res.json();
-      repos = (data.values || []).map(r => r.slug).filter(Boolean);
+  let repos = reposOverride;
+  if (!repos) {
+    if (cfg.bbRepos) {
+      repos = cfg.bbRepos.split(',').map(r => r.trim());
+    } else {
+      const reposUrl = `https://api.bitbucket.org/2.0/repositories/${cfg.bbWorkspace}?pagelen=100`;
+      const res = await fetch(reposUrl, { headers });
+      if (res.ok) {
+        const data = await res.json();
+        repos = (data.values || []).map(r => r.slug).filter(Boolean);
+      }
     }
   }
 
@@ -245,13 +256,77 @@ async function fetchBitbucket(cfg, sinceStr) {
   return commits;
 }
 
+function bbHeaders(cfg) {
+  const headers = { 'Accept': 'application/json' };
+  if (cfg.bbToken) {
+    if (cfg.bbToken.startsWith('ATATT')) {
+      headers['Authorization'] = 'Basic ' + btoa(`${cfg.jiraEmail}:${cfg.bbToken}`);
+    } else {
+      headers['Authorization'] = `Bearer ${cfg.bbToken}`;
+    }
+  }
+  return headers;
+}
+
+async function fetchJiraProjects(cfg) {
+  const url = `${cfg.jiraUrl.replace(/\/$/, '')}/rest/api/3/project`;
+  const headers = {
+    'Authorization': 'Basic ' + btoa(`${cfg.jiraEmail}:${cfg.jiraToken}`),
+    'Accept': 'application/json'
+  };
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error('Jira API error: ' + res.statusText);
+  return await res.json();
+}
+
+async function fetchBitbucketRepos(cfg) {
+  const url = `https://api.bitbucket.org/2.0/repositories/${cfg.bbWorkspace}?pagelen=100`;
+  const headers = bbHeaders(cfg);
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error('Bitbucket API error: ' + res.statusText);
+  const data = await res.json();
+  return (data.values || []).map(r => r.slug).filter(Boolean);
+}
+
+function normalizeStr(s) {
+  return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+async function suggestInitiativeConfig(cfg, initiatives) {
+  const [jiraProjects, bbRepos] = await Promise.all([
+    fetchJiraProjects(cfg).catch(() => []),
+    fetchBitbucketRepos(cfg).catch(() => [])
+  ]);
+
+  const repos = {};
+  const projects = {};
+
+  for (const init of initiatives) {
+    const norm = normalizeStr(init.name);
+
+    const matchedProject = jiraProjects.find(p =>
+      normalizeStr(p.name).includes(norm) || normalizeStr(p.key).includes(norm)
+    );
+    if (matchedProject) projects[init.id] = matchedProject.key;
+
+    const keywords = norm.split(/\s+/);
+    const matchedRepos = bbRepos.filter(r => {
+      const rNorm = normalizeStr(r);
+      return keywords.some(k => rNorm.includes(k));
+    });
+    if (matchedRepos.length) repos[init.id] = matchedRepos.join(', ');
+  }
+
+  return { repos, projects };
+}
+
 // --- Geracao de texto: motor plugavel (Fase 4: Gemini ou Claude) ------------------
 
-function buildDraftPrompt(jiraAct, bbAct, { withJsonInstruction }) {
+function buildDraftPrompt(jiraAct, bbAct, initiativeName, { withJsonInstruction }) {
   const context = { jira_issues_updated: jiraAct, bitbucket_commits: bbAct };
   let prompt = `
-Você é um desenvolvedor preenchendo o check-in diário de atividades.
-Com base nas seguintes informações de atividades brutas coletadas do Jira e Bitbucket, gere dois blocos de texto em português (um para "yesterday" e outro para "today").
+Você é um desenvolvedor preenchendo o check-in diário de atividades para a iniciativa "${initiativeName}".
+Com base nas seguintes informações de atividades brutas coletadas do Jira e Bitbucket, gere dois blocos de texto em português (um para "yesterday" e outro para "today") relacionados a esta iniciativa.
 
 Regras importantes:
 1. Escreva em português, de forma profissional, direta e natural, no estilo de atualização diária (daily).
@@ -274,10 +349,10 @@ ${JSON.stringify(context, null, 2)}
   return prompt;
 }
 
-async function fetchGemini(apiKey, jiraAct, bbAct) {
+async function fetchGemini(apiKey, jiraAct, bbAct, initiativeName) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
   const payload = {
-    contents: [{ parts: [{ text: buildDraftPrompt(jiraAct, bbAct, { withJsonInstruction: true }) }] }],
+    contents: [{ parts: [{ text: buildDraftPrompt(jiraAct, bbAct, initiativeName, { withJsonInstruction: true }) }] }],
     generationConfig: { responseMimeType: 'application/json' }
   };
 
@@ -303,7 +378,7 @@ async function fetchGemini(apiKey, jiraAct, bbAct) {
 // Claude via Messages API direto do browser — exige a API key do proprio dev e
 // o header de opt-in anthropic-dangerous-direct-browser-access (a key vive so
 // no storage local do navegador, nunca num backend compartilhado).
-async function fetchClaude(apiKey, jiraAct, bbAct) {
+async function fetchClaude(apiKey, jiraAct, bbAct, initiativeName) {
   const payload = {
     model: 'claude-sonnet-5',
     max_tokens: 1024,
@@ -322,7 +397,7 @@ async function fetchClaude(apiKey, jiraAct, bbAct) {
       }
     },
     messages: [
-      { role: 'user', content: buildDraftPrompt(jiraAct, bbAct, { withJsonInstruction: false }) }
+      { role: 'user', content: buildDraftPrompt(jiraAct, bbAct, initiativeName, { withJsonInstruction: false }) }
     ]
   };
 
@@ -353,19 +428,19 @@ async function fetchClaude(apiKey, jiraAct, bbAct) {
 
 // Ponto unico de geracao: escolhe o provider configurado e cai no template
 // deterministico se o LLM falhar/nao estiver configurado.
-async function generateDraft(cfg, jiraAct, bbAct) {
+async function generateDraft(cfg, jiraAct, bbAct, initiativeName) {
   const provider = cfg.llmProvider || 'gemini';
   let result = null;
   if (provider === 'claude' && cfg.anthropicKey) {
-    result = await fetchClaude(cfg.anthropicKey, jiraAct, bbAct);
+    result = await fetchClaude(cfg.anthropicKey, jiraAct, bbAct, initiativeName);
   } else if (cfg.geminiKey) {
-    result = await fetchGemini(cfg.geminiKey, jiraAct, bbAct);
+    result = await fetchGemini(cfg.geminiKey, jiraAct, bbAct, initiativeName);
   }
   if (result && result.yesterday && result.today) return result;
-  return generateTemplate(jiraAct, bbAct);
+  return generateTemplate(jiraAct, bbAct, initiativeName);
 }
 
-function generateTemplate(jiraAct, bbAct) {
+function generateTemplate(jiraAct, bbAct, initiativeName) {
   let yesterday = '';
   if (jiraAct.length > 0) {
     yesterday += 'Tasks atualizadas:\n' + jiraAct.map(i => `  - [${i.key}] ${i.summary} (${i.status})`).join('\n') + '\n';
@@ -374,7 +449,7 @@ function generateTemplate(jiraAct, bbAct) {
     yesterday += 'Commits realizados:\n' + bbAct.map(c => `  - [${c.repo}] ${c.message}`).join('\n');
   }
   if (!yesterday) {
-    yesterday = 'Sem atividades registradas no Jira/Bitbucket.';
+    yesterday = 'Sem atividades registradas no Jira/Bitbucket para esta iniciativa.';
   }
 
   const inProgress = jiraAct.filter(i => ['in progress', 'em andamento', 'doing'].includes(i.status.toLowerCase()));
@@ -382,7 +457,7 @@ function generateTemplate(jiraAct, bbAct) {
   if (inProgress.length > 0) {
     today = 'Continuar trabalhando em:\n' + inProgress.map(i => `  - [${i.key}] ${i.summary}`).join('\n');
   } else {
-    today = 'Continuar as atividades pendentes e atuar em novas demandas do board.';
+    today = `Continuar as atividades pendentes da iniciativa "${initiativeName}" e atuar em novas demandas do board.`;
   }
   return { yesterday, today };
 }
@@ -520,9 +595,16 @@ async function runAutoCheckin() {
     // 6. Coleta + geracao
     const sinceDate = getLastBusinessDay();
     const sinceStr = localIsoDate(sinceDate);
-    const jiraAct = cfg.jiraUrl && cfg.jiraEmail && cfg.jiraToken ? await fetchJira(cfg, sinceStr) : [];
-    const bbAct = await fetchBitbucket(cfg, sinceStr);
-    const draft = await generateDraft(cfg, jiraAct, bbAct);
+    const initiativeCfg = cfg.initiativeConfig || {};
+    const oldRepos = cfg.initiativeRepos || {};
+    const projectKeys = (initiativeCfg.projects || {})[String(initiative)];
+    const jiraAct = cfg.jiraUrl && cfg.jiraEmail && cfg.jiraToken ? await fetchJira(cfg, sinceStr, projectKeys) : [];
+    const repos = (initiativeCfg.repos || oldRepos)[String(initiative)];
+    const bbRepos = repos ? repos.split(',').map(r => r.trim()) : undefined;
+    const bbAct = await fetchBitbucket(cfg, sinceStr, bbRepos);
+    const allInitiatives = await fetchInitiatives();
+    const initiativeName = (allInitiatives.find(i => i.id === initiative)?.name) || String(initiative);
+    const draft = await generateDraft(cfg, jiraAct, bbAct, initiativeName);
     let yesterdayTxt = draft.yesterday;
     const todayTxt = draft.today;
     if (isHoliday(sinceDate)) yesterdayTxt = '';
