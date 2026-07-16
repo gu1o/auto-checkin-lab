@@ -37,8 +37,7 @@
           <div class="col">
             <label for="checkin-initiative">Iniciativa</label>
             <select id="checkin-initiative" class="form-control">
-              <option value="6">6 - Auditoria Ideal</option>
-              <option value="17">17 - Soluções Industriais</option>
+              <option value="">Carregando iniciativas...</option>
             </select>
           </div>
           <div class="col flex-grow-0">
@@ -126,10 +125,18 @@
                 <input type="text" id="bb-workspace" class="form-control" placeholder="Ex: idealtrends">
               </div>
             </div>
-            <div class="form-group">
-              <label for="bb-repos">Repositórios (separados por vírgula)</label>
-              <input type="text" id="bb-repos" class="form-control" placeholder="Ex: auditoriaideal.com.br, outro-repo (vazio para todos)">
+          </div>
+
+          <!-- Config por Iniciativa -->
+          <div class="section-card" id="initiative-config-card">
+            <h4>Projetos e Repositórios por Iniciativa</h4>
+            <div id="initiative-config-container">
+              <p class="text-muted" style="font-size: 12px; opacity: 0.6;">As iniciativas serão carregadas ao salvar</p>
             </div>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-suggest" style="margin-top: 12px;">
+              <span class="spinner hidden" id="suggest-spinner"></span>
+              💡 Sugerir automaticamente
+            </button>
           </div>
 
           <!-- LLM Settings (motor plugavel: Gemini ou Claude) -->
@@ -180,8 +187,7 @@
               <div class="col">
                 <label for="default-initiative">Iniciativa padrão</label>
                 <select id="default-initiative" class="form-control">
-                  <option value="6">6 - Auditoria Ideal</option>
-                  <option value="17">17 - Soluções Industriais</option>
+                  <option value="">Carregando iniciativas...</option>
                 </select>
               </div>
               <div class="col">
@@ -198,7 +204,15 @@
           </div>
 
           <button type="submit" class="btn btn-primary btn-block">Salvar Configurações</button>
-          <button type="button" class="btn btn-secondary btn-block" id="btn-export">Exportar config.json (para o CLI/cron)</button>
+          <div class="row" style="gap: 8px; margin-top: 8px;">
+            <div class="col">
+              <button type="button" class="btn btn-secondary btn-block" id="btn-export">Exportar config.json</button>
+            </div>
+            <div class="col">
+              <button type="button" class="btn btn-secondary btn-block" id="btn-import">Importar config.json</button>
+              <input type="file" id="import-file" accept=".json" style="display: none">
+            </div>
+          </div>
         </form>
       </section>
     </main>
