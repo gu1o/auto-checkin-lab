@@ -10,8 +10,9 @@ Script e Extensão do Chrome para preencher e auditar o check-in diário de **Sa
 
 | Arquivo/Diretório | Descrição |
 |---|---|
-| `.claude/skills/setup-checkin/` | Skill do Claude Code: rode `/setup-checkin` na pasta do repo para configurar o check-in automático guiado (importa o export da extensão, valida credenciais e cria a rotina agendada na sua conta) |
-| `checkin.sh` | CLI principal (subcomandos `status`, `submit` e `auto`) |
+| `.claude/skills/setup-checkin/` | Skill do Claude Code: rode `/setup-checkin` na pasta do repo para configurar o check-in automático guiado — escolhe onde roda (rotina na nuvem ou cron local), pega as credenciais dos conectores MCP (Atlassian/Ideal Lab) ou do export da extensão, valida e agenda |
+| `.claude/settings.json` | Hook `SessionStart`: se o repo ainda não tem `config.json`, o Claude abre a sessão perguntando ao dev qual setup ele quer e chama a skill sozinho |
+| `checkin.sh` | CLI principal (subcomandos `status`, `submit`, `auto` e os skips locais `pular`/`retomar`/`pulos`) |
 | `auto_activity.py` | Script auxiliar que busca tarefas no Jira, commits no Bitbucket e sintetiza textos usando Gemini |
 | `config.json.example` | Template de configuração para as integrações do Jira, Bitbucket, Gemini/Claude e Telegram |
 | `extension/` | Código fonte da Extensão do Chrome (auditoria/envio manual + modo automático via `chrome.alarms`; `lib.js` compartilhado entre `popup.js` e `background.js`) |
@@ -95,6 +96,11 @@ O subcomando `auto` coleta seus dados das APIs, resume usando IA e realiza a pos
 
 * **Inteligência de Feriados**: O modo automático ignora finais de semana e feriados (incluindo cálculo dinâmico de feriados móveis como Carnaval, Sexta-feira Santa e Corpus Christi, além de feriados federais e de SP). 
 * **Respeita o `/pular`**: se o dia foi cancelado via `/pular` no @CheckInLabBot (mensagem fixada no chat, lida via `getChat` com o `telegram` do `config.json`), o script não preenche e avisa no Telegram (🚫). Sem Telegram configurado, a checagem é pulada; falha na chamada não bloqueia o check-in.
+* **Skip local (sem Telegram)**: `./checkin.sh pular DD/MM` (também `hoje`/`amanha`/`YYYY-MM-DD`) grava a data em `.skips.json` e o `auto` respeita; `retomar DD/MM` desfaz e `pulos` lista.
+* **Filtro de repositórios por padrão**: `bitbucket.repositories` no `config.json` aceita **padrões** (regex/substring, case-insensitive) casados contra os repos do workspace — ex.: `["auditoriaideal"]` pega `auditoriaideal.com.br`, `api.auditoriaideal.com.br` e `local-infra.auditoriaideal.com.br` (e futuros com o mesmo nome) sem listar slug a slug; um slug exato continua valendo. `bitbucket.repositories_exclude` remove padrões (ex.: `["-old$"]` tira o repositório antigo). Vazio = todos do workspace (ou do `project_key`). Padrão sem match vira aviso no log.
+* **Roteamento multi-iniciativa**: com `initiative_config` no `config.json` (mapas `repos`/`projects` por id de iniciativa), o `auto` roteia a atividade e faz um submit por iniciativa com atividade; `--initiative` é a padrão (atividade não mapeada + dia sem atividade).
+* **Agendamento (modelo tick)**: com `schedule.enabled`/`schedule.time` no `config.json`, uma crontab de tick (ex.: a cada 15 min) só envia no/depois do horário e uma vez por dia — resolve máquina desligada no horário exato. `--force` ignora o gate.
+* **Notificação via worker (opcional)**: com `notify.url`+`notify.secret`, as notificações vão pelo endpoint `/notify` do worker (o `bot_token` sai do config do dev); sem eles, envio direto pelo Telegram.
 * **Ontem Vazio**: Se o dia anterior foi um feriado ou fim de semana, a seção `ONTEM` será automaticamente enviada em branco.
 * **Sem Duplicidade**: Se o check-in do dia já foi preenchido, o script pula a execução para evitar sobrescrever dados manuais.
 

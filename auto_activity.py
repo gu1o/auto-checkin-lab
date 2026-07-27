@@ -2,10 +2,14 @@
 import os
 import sys
 import json
+import re
 import urllib.request
 import urllib.parse
 import base64
 import datetime
+
+# Padrao de chave de issue do Jira em texto livre (branch/commit), ex: AUD-123.
+PROJECT_KEY_RE = re.compile(r'\b([A-Z][A-Z0-9]+)-\d+\b')
 
 def log(msg):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
@@ -112,6 +116,94 @@ def make_request(url, headers=None, method="GET", data=None):
         return None
 
 
+def _repo_matches(pattern, repo):
+    """Casa `pattern` contra o slug `repo`: exato (case-insensitive) ou regex
+    (re.search, case-insensitive). Padrao invalido como regex cai para
+    comparacao de substring, para nunca quebrar a coleta por um regex ruim."""
+    if not pattern:
+        return False
+    p, r = pattern.strip(), repo.strip()
+    if p.lower() == r.lower():
+        return True
+    try:
+        return re.search(p, r, re.IGNORECASE) is not None
+    except re.error:
+        return p.lower() in r.lower()
+
+
+def _select_repos(universe, patterns, exclude):
+    """Seleciona repos do `universe` (slugs do workspace) casando `patterns`
+    (regex/substring). Sem patterns => todos. Aplica `exclude` por fim.
+
+    Retorna (selected, unmatched): unmatched = padroes que nao casaram com nada
+    (viram warning para o dev ajustar o mapeamento).
+    """
+    if patterns:
+        selected = [r for r in universe if any(_repo_matches(p, r) for p in patterns)]
+        unmatched = [p for p in patterns if not any(_repo_matches(p, r) for r in universe)]
+    else:
+        selected, unmatched = list(universe), []
+    if exclude:
+        selected = [r for r in selected if not any(_repo_matches(e, r) for e in exclude)]
+    return selected, unmatched
+
+
+def _bitbucket_auth_headers(config):
+    """Monta os headers autenticados do Bitbucket a partir do config. Aceita
+    token Atlassian (ATATT... => Basic com o e-mail do Jira), access token
+    (=> Bearer) ou username+app_password (=> Basic). Retorna None se faltar
+    credencial (o chamador loga e aborta a coleta do Bitbucket)."""
+    bb_cfg = config.get("bitbucket", {})
+    token = bb_cfg.get("api_token")
+    username = bb_cfg.get("username")
+    password = bb_cfg.get("app_password")
+    headers = {"Accept": "application/json"}
+    if token:
+        if token.startswith("ATATT"):
+            email = config.get("jira", {}).get("email")
+            if not email:
+                log("Bitbucket api_token is an Atlassian token, but no Jira email was found in configuration.")
+                return None
+            auth_b64 = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("utf-8")
+            headers["Authorization"] = f"Basic {auth_b64}"
+        else:
+            headers["Authorization"] = f"Bearer {token}"
+    elif username and password:
+        auth_b64 = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
+        headers["Authorization"] = f"Basic {auth_b64}"
+    else:
+        return None
+    return headers
+
+
+def _list_workspace_repos(headers, workspace, project_key=None):
+    """Lista (paginado) os slugs de repositorio do workspace; filtra por
+    `project_key` se informado. Retorna [] em erro/sem permissao de listagem."""
+    if project_key:
+        q = urllib.parse.quote(f'project.key="{project_key}"')
+        repos_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}?pagelen=100&q={q}"
+    else:
+        repos_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}?pagelen=100"
+    # Bitbucket devolve `next` (URL completa) enquanto ha mais paginas; sem
+    # paginar, workspaces com >100 repos eram truncados silenciosamente.
+    repos = []
+    page = 0
+    while repos_url and page < 50:  # teto de seguranca contra loop
+        res_text = make_request(repos_url, headers)
+        if not res_text:
+            break
+        try:
+            data = json.loads(res_text)
+            repos.extend(r.get("slug") for r in data.get("values", []) if r.get("slug"))
+            repos_url = data.get("next")
+            page += 1
+        except Exception as e:
+            log(f"Error parsing Bitbucket repos: {e}")
+            break
+    log(f"Discovered {len(repos)} repositories in workspace '{workspace}'.")
+    return repos
+
+
 def get_jira_activity(config, since_date):
     jira_cfg = config.get("jira", {})
     url = jira_cfg.get("url")
@@ -165,34 +257,14 @@ def get_jira_activity(config, since_date):
 def get_bitbucket_activity(config, since_date):
     bb_cfg = config.get("bitbucket", {})
     username = bb_cfg.get("username")
-    password = bb_cfg.get("app_password")
-    token = bb_cfg.get("api_token")
     workspace = bb_cfg.get("workspace")
-    repos = bb_cfg.get("repositories", [])
-    
+
     if not workspace:
         log("Bitbucket workspace not configured. Skipping Bitbucket.")
         return []
-        
-    headers = {
-        "Accept": "application/json"
-    }
-    if token:
-        if token.startswith("ATATT"):
-            email = config.get("jira", {}).get("email")
-            if not email:
-                log("Bitbucket api_token is an Atlassian token, but no Jira email was found in configuration. Skipping Bitbucket.")
-                return []
-            auth_str = f"{email}:{token}"
-            auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
-            headers["Authorization"] = f"Basic {auth_b64}"
-        else:
-            headers["Authorization"] = f"Bearer {token}"
-    elif username and password:
-        auth_str = f"{username}:{password}"
-        auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
-        headers["Authorization"] = f"Basic {auth_b64}"
-    else:
+
+    headers = _bitbucket_auth_headers(config)
+    if headers is None:
         log("Bitbucket credentials not fully configured. Skipping Bitbucket.")
         return []
     if not username:
@@ -207,18 +279,29 @@ def get_bitbucket_activity(config, since_date):
             except Exception as e:
                 log(f"Could not auto-detect Bitbucket user info: {e}")
                 
-    # If no repositories specified, auto-discover them
-    if not repos:
-        log(f"No repositories specified. Fetching repo list for workspace '{workspace}'...")
-        repos_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}?pagelen=100"
-        res_text = make_request(repos_url, headers)
-        if res_text:
-            try:
-                data = json.loads(res_text)
-                repos = [r.get("slug") for r in data.get("values", []) if r.get("slug")]
-            except Exception as e:
-                log(f"Error parsing Bitbucket repos: {e}")
-    
+    # Resolucao de repositorios. As entradas de `repositories` sao tratadas como
+    # PADROES (regex/substring, case-insensitive) e casadas contra os repos do
+    # workspace: assim "auditoriaideal" pega os 3 repos do projeto (e futuros)
+    # sem listar slug a slug; um slug exato continua valendo (casa consigo).
+    # `repositories_exclude` remove padroes (ex.: o repo antigo "...-old").
+    # Sem `repositories`, mantem o comportamento anterior (project_key > todos).
+    patterns = bb_cfg.get("repositories", []) or []
+    exclude = bb_cfg.get("repositories_exclude", []) or []
+    project_key = bb_cfg.get("project_key")
+    universe = _list_workspace_repos(headers, workspace, project_key)
+
+    if universe:
+        repos, unmatched = _select_repos(universe, patterns, exclude)
+        for p in unmatched:
+            log(f"Warning: no repo in workspace matches pattern '{p}'. Adjust `repositories`.")
+    else:
+        # Nao consegui listar o workspace (permissao/erro): usa os padroes como
+        # slugs literais para nao zerar a coleta (menos os do exclude).
+        repos = [p for p in patterns if not any(_repo_matches(e, p) for e in exclude)]
+        if repos:
+            log("Could not list workspace; falling back to literal repository entries.")
+    log(f"Selected {len(repos)} repositories: {', '.join(repos) if repos else '(none)'}")
+
     commits = []
     since_iso = since_date.isoformat()
     
@@ -343,31 +426,16 @@ Dados de atividade:
         log(f"Error parsing Gemini API response: {e}")
         return None
 
-def main():
-    dir_path = os.path.dirname(os.path.realpath(__file__))
-    config_path = os.path.join(dir_path, "config.json")
-    
-    if not os.path.exists(config_path):
-        log(f"config.json not found in {dir_path}. Please copy config.json.example to config.json and configure it.")
-        sys.exit(1)
-        
-    with open(config_path, "r") as f:
-        config = json.load(f)
-        
-    since_date = get_last_business_day()
-    yesterday_is_holiday = is_holiday(since_date)
-    
-    jira_act = get_jira_activity(config, since_date)
-    bb_act = get_bitbucket_activity(config, since_date)
-    
+def build_checkin_text(config, jira_act, bb_act, yesterday_is_holiday):
+    """Gera (yesterday, today) para um conjunto de atividades (Gemini -> template)."""
     yesterday_txt, today_txt = None, None
-    
+
     gemini_key = config.get("gemini", {}).get("api_key")
     if gemini_key:
         result = generate_text_gemini(gemini_key, jira_act, bb_act)
         if result:
             yesterday_txt, today_txt = result
-            
+
     if not yesterday_txt or not today_txt:
         log("Using template-based generation.")
         yesterday_txt_tpl, today_txt_tpl = generate_text_template(jira_act, bb_act)
@@ -375,16 +443,189 @@ def main():
             yesterday_txt = yesterday_txt_tpl
         if not today_txt:
             today_txt = today_txt_tpl
-            
+
     if yesterday_is_holiday:
         log("Yesterday was a holiday/weekend. Overriding yesterday text to empty.")
         yesterday_txt = ""
-        
-    output = {
-        "yesterday": yesterday_txt,
-        "today": today_txt
-    }
-    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+    return yesterday_txt, today_txt
+
+def _split_csv(value):
+    return [x.strip() for x in str(value or "").split(",") if x.strip()]
+
+def route_activity(jira_act, bb_act, initiative_config, default_initiative):
+    """Particiona a atividade por iniciativa segundo o initiative_config da extensao
+    ({"repos": {id: "repoA, repoB"}, "projects": {id: "AUD, SI"}}).
+
+    Roteamento: issue do Jira pela project key (prefixo de KEY-123); commit pelo
+    repo, com fallback para a project key achada na mensagem do commit. Atividade
+    sem mapeamento cai na iniciativa padrao com aviso.
+
+    Retorna (buckets, warnings): buckets = {init_id(int): {"jira": [...], "bb": [...]}}.
+    """
+    initiative_config = initiative_config or {}
+    repos_map = initiative_config.get("repos") or {}
+    projects_map = initiative_config.get("projects") or {}
+
+    proj_to_init = {}
+    for init_id, val in projects_map.items():
+        for pk in _split_csv(val):
+            proj_to_init[pk.upper()] = int(init_id)
+    repo_to_init = {}
+    for init_id, val in repos_map.items():
+        for repo in _split_csv(val):
+            repo_to_init[repo.lower()] = int(init_id)
+
+    buckets = {}
+    def bucket(init_id):
+        return buckets.setdefault(int(init_id), {"jira": [], "bb": []})
+
+    unmapped_jira, unmapped_bb = [], []
+
+    for item in jira_act:
+        key = item.get("key") or ""
+        pk = key.split("-")[0].upper() if "-" in key else ""
+        init_id = proj_to_init.get(pk)
+        if init_id is not None:
+            bucket(init_id)["jira"].append(item)
+        else:
+            unmapped_jira.append(item)
+
+    for c in bb_act:
+        init_id = repo_to_init.get((c.get("repo") or "").lower())
+        if init_id is None:
+            m = PROJECT_KEY_RE.search(c.get("message") or "")
+            if m:
+                init_id = proj_to_init.get(m.group(1).upper())
+        if init_id is not None:
+            bucket(init_id)["bb"].append(c)
+        else:
+            unmapped_bb.append(c)
+
+    warnings = []
+    if unmapped_jira or unmapped_bb:
+        b = bucket(default_initiative)
+        b["jira"].extend(unmapped_jira)
+        b["bb"].extend(unmapped_bb)
+        unk_projects = sorted({
+            (i.get("key") or "").split("-")[0].upper()
+            for i in unmapped_jira if "-" in (i.get("key") or "")
+        })
+        unk_repos = sorted({(c.get("repo") or "") for c in unmapped_bb if c.get("repo")})
+        parts = []
+        if unk_projects:
+            parts.append("projetos " + ", ".join(unk_projects))
+        if unk_repos:
+            parts.append("repos " + ", ".join(unk_repos))
+        detail = f" ({'; '.join(parts)})" if parts else ""
+        warnings.append(
+            f"Atividade nao mapeada{detail} roteada para a iniciativa padrao "
+            f"{default_initiative}. Ajuste o mapeamento em initiative_config."
+        )
+
+    return buckets, warnings
+
+def list_repos_cli(config, pattern):
+    """Confirmacao interativa: lista os repos do workspace que casam com
+    `pattern` (ou, sem pattern, com o `repositories` do config), destacando os
+    removidos por `repositories_exclude`. So leitura — nada e enviado."""
+    bb_cfg = config.get("bitbucket", {})
+    workspace = bb_cfg.get("workspace")
+    if not workspace:
+        print("Bitbucket workspace nao configurado no config.json.")
+        return 1
+    headers = _bitbucket_auth_headers(config)
+    if headers is None:
+        print("Credenciais do Bitbucket incompletas no config.json.")
+        return 1
+    universe = _list_workspace_repos(headers, workspace, bb_cfg.get("project_key"))
+    if not universe:
+        print("Nao consegui listar os repositorios do workspace (permissao do token? Repositories:Read).")
+        return 1
+
+    exclude = bb_cfg.get("repositories_exclude", []) or []
+    patterns = [pattern] if pattern else (bb_cfg.get("repositories", []) or [])
+    selected, unmatched = _select_repos(universe, patterns, exclude)
+    label = f"padrao '{pattern}'" if pattern else "config atual (bitbucket.repositories)"
+
+    print(f"{len(selected)} repositorio(s) batem com {label}:")
+    for r in selected:
+        print(f"  - {r}")
+    if patterns and exclude:
+        excluded_hits = [
+            r for r in universe
+            if any(_repo_matches(p, r) for p in patterns) and any(_repo_matches(e, r) for e in exclude)
+        ]
+        if excluded_hits:
+            print(f"Removidos por repositories_exclude ({', '.join(exclude)}):")
+            for r in excluded_hits:
+                print(f"  - {r}")
+    if unmatched:
+        print("Padroes sem nenhum match: " + ", ".join(unmatched))
+    return 0
+
+
+def main():
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    config_path = os.path.join(dir_path, "config.json")
+
+    if not os.path.exists(config_path):
+        log(f"config.json not found in {dir_path}. Please copy config.json.example to config.json and configure it.")
+        sys.exit(1)
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    # Modo confirmacao (so leitura): `--list-repos [padrao]`. Mostra quais repos
+    # do workspace casam com o padrao (ou com o config), sem coletar/enviar nada.
+    cli_args = sys.argv[1:]
+    if "--list-repos" in cli_args:
+        idx = cli_args.index("--list-repos")
+        pattern = ""
+        if idx + 1 < len(cli_args) and not cli_args[idx + 1].startswith("--"):
+            pattern = cli_args[idx + 1]
+        sys.exit(list_repos_cli(config, pattern))
+
+    # Iniciativa padrao: recebe atividade nao mapeada e o dia sem atividade.
+    default_initiative = 6
+    args = sys.argv[1:]
+    if "--default-initiative" in args:
+        try:
+            default_initiative = int(args[args.index("--default-initiative") + 1])
+        except (IndexError, ValueError):
+            log("Ignoring invalid --default-initiative; using 6.")
+
+    since_date = get_last_business_day()
+    yesterday_is_holiday = is_holiday(since_date)
+
+    jira_act = get_jira_activity(config, since_date)
+    bb_act = get_bitbucket_activity(config, since_date)
+
+    initiative_config = config.get("initiative_config") or {}
+    has_map = bool(initiative_config.get("repos")) or bool(initiative_config.get("projects"))
+
+    checkins = []
+    warnings = []
+
+    if not has_map:
+        # Mapa vazio: comportamento atual — uma iniciativa padrao com toda a atividade.
+        y, t = build_checkin_text(config, jira_act, bb_act, yesterday_is_holiday)
+        checkins.append({"initiative": default_initiative, "yesterday": y, "today": t})
+    else:
+        buckets, warnings = route_activity(jira_act, bb_act, initiative_config, default_initiative)
+        for init_id in sorted(buckets):
+            b = buckets[init_id]
+            if not b["jira"] and not b["bb"]:
+                continue  # iniciativa sem atividade no dia: pula (fica pendente no Lab)
+            y, t = build_checkin_text(config, b["jira"], b["bb"], yesterday_is_holiday)
+            checkins.append({"initiative": init_id, "yesterday": y, "today": t})
+        # Dia sem nenhuma atividade mapeada: garante o check-in da iniciativa padrao
+        # (evita regressao silenciosa de quem ativa o multi-iniciativa).
+        if not checkins:
+            y, t = build_checkin_text(config, [], [], yesterday_is_holiday)
+            checkins.append({"initiative": default_initiative, "yesterday": y, "today": t})
+
+    print(json.dumps({"checkins": checkins, "warnings": warnings}, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
     main()

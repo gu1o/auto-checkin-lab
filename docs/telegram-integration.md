@@ -1,9 +1,12 @@
 # Proposta: Integração Telegram (notificação + controle remoto)
 
 > **Status: Funcionalidade 1 (notificação) implementada no `checkin.sh` e nas
-> rotinas cloud; da Funcionalidade 2, o comando `/pular` foi implementado nas
-> rotinas cloud via modo piggyback (2026-07-14) — o restante (poller local,
-> `/horario`, `schedule` no config) segue proposta.**
+> rotinas cloud; Funcionalidade 2 implementada (2026-07-17): bloco `schedule`
+> no config + tick guard idempotente no `cmd_auto` (com `--force`), e os
+> comandos `/status`, `/horario`, `/pausar`, `/ativar`, `/agora`, `/dryrun` no
+> poller local (`telegram_poller.py`, plano B — só roda com o webhook do worker
+> desativado, pois `getUpdates`/webhook são mutuamente exclusivos). O `/pular`
+> interativo já vive no worker (webhook) desde 2026-07-14.**
 > Este documento especifica duas funcionalidades debatidas pelo time para serem
 > aplicadas sobre o `checkin.sh` e a cron que o agenda.
 >
@@ -182,6 +185,41 @@ Parte do time roda o `auto` por crontab local; o Guilherme roda por uma
   UI em claude.ai/code/routines. Um bot do Telegram **não** consegue alterar
   a rotina cloud diretamente (não há API pública para isso) — o comando
   `/horario` do poller só faz sentido para quem usa crontab local.
+
+---
+
+## `/painel` e `/repos` — inspeção e gestão do escopo pelo bot (worker)
+
+Dois comandos no **worker** (`worker/worker.js`), operando sobre as credenciais
+criptografadas do dev no KV (`secrets:<chatId>`), sem nada passar pelo chat:
+
+- **`/painel`** — resumo **somente leitura** de como o check-in automático está
+  configurado: iniciativa padrão, notificações e horário (de `prefs`);
+  integrações configuradas (Jira, Bitbucket com workspace/project, provider e
+  chaves de LLM, cookie do Lab) sem revelar segredos; **escopo atual de repos**;
+  e os skips agendados (lidos da mensagem fixada). Complementa o `/config`
+  (edita) e o `/testar` (valida em tempo real).
+
+- **`/repos`** — lista os repositórios do workspace (API Bitbucket, com o token
+  salvo) num teclado inline. O escopo vive em `secrets.bitbucket.repositories`
+  (mesmo campo do `/config` e do `auto_activity.py`). Tocar num repo o
+  **adiciona/remove do escopo e salva na hora** (re-encripta o KV);
+  `🧹 Limpar` esvazia a lista. **Convenção: lista vazia = todos os repos.**
+  A marcação ✅ usa a mesma casação de padrões do coletor (`repoMatches` ↔
+  `_repo_matches`), então reflete o que de fato entra na coleta. O universo de
+  repos fica em cache curto (`reposui:<chatId>`, TTL 10 min) para os toggles
+  referenciarem por índice (callback_data enxuto); expirado, é só remandar
+  `/repos`. Paginação de 12 em 12 quando o workspace tem muitos repos.
+
+  Detalhe de implementação: o handler de callback do worker limpa o teclado a
+  cada clique nos fluxos one-shot; o `/repos` é exceção (`cmd !== 'rp'`) porque
+  seu teclado é persistente e re-renderiza a cada toggle.
+
+> Paridade CLI/poller (pendente, opcional): o `checkin.sh repos [PADRÃO]` já faz
+> a listagem **somente leitura** contra o `bitbucket.repositories` do
+> `config.json` local. Um `/repos` com escrita e um `/painel` no
+> `telegram_poller.py` seriam o equivalente para quem roda por crontab local
+> (editando o `config.json` em vez do KV) — ainda não implementados.
 
 ---
 

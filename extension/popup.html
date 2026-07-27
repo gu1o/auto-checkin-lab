@@ -84,6 +84,10 @@
         <button type="button" class="btn btn-primary btn-block" id="btn-submit" disabled>
           Enviar Check-in
         </button>
+        <button type="button" class="btn btn-secondary btn-block" id="btn-skip-tomorrow" style="margin-top: 8px;">
+          🚫 Pular amanhã (automático)
+        </button>
+        <p id="local-skips" class="text-muted" style="font-size: 12px; opacity: 0.6; margin-top: 6px;"></p>
       </section>
 
       <!-- Configuration Tab -->
@@ -125,6 +129,10 @@
                 <input type="text" id="bb-workspace" class="form-control" placeholder="Ex: idealtrends">
               </div>
             </div>
+            <div class="form-group">
+              <label for="bb-project-key">Project key (opcional)</label>
+              <input type="text" id="bb-project-key" class="form-control" placeholder="Ex: IDEALPLUS — filtra repos por project (vazio = todos)">
+            </div>
           </div>
 
           <!-- Config por Iniciativa -->
@@ -133,10 +141,21 @@
             <div id="initiative-config-container">
               <p class="text-muted" style="font-size: 12px; opacity: 0.6;">As iniciativas serão carregadas ao salvar</p>
             </div>
-            <button type="button" class="btn btn-secondary btn-sm" id="btn-suggest" style="margin-top: 12px;">
-              <span class="spinner hidden" id="suggest-spinner"></span>
-              💡 Sugerir automaticamente
-            </button>
+            <div class="row" style="gap: 8px; margin-top: 12px;">
+              <div class="col">
+                <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-suggest">
+                  <span class="spinner hidden" id="suggest-spinner"></span>
+                  💡 Sugerir automaticamente
+                </button>
+              </div>
+              <div class="col">
+                <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-detect-unmapped">
+                  <span class="spinner hidden" id="detect-spinner"></span>
+                  🔍 Detectar projetos novos
+                </button>
+              </div>
+            </div>
+            <div id="unmapped-container" style="margin-top: 12px;"></div>
           </div>
 
           <!-- LLM Settings (motor plugavel: Gemini ou Claude) -->
@@ -171,13 +190,31 @@
               </div>
               <div class="col">
                 <label for="tg-chat-id">Seu chat_id</label>
-                <input type="text" id="tg-chat-id" class="form-control" placeholder="Mande /start pro @CheckInLabBot">
+                <input type="text" id="tg-chat-id" class="form-control" placeholder="Conecte pelo botão abaixo ou /start no bot">
               </div>
             </div>
-            <button type="button" class="btn btn-secondary btn-sm" id="btn-tg-test">
-              <span class="spinner hidden" id="tg-test-spinner"></span>
-              🧪 Enviar mensagem de teste
-            </button>
+            <div class="form-group">
+              <label for="tg-worker-url">URL do worker (bot)</label>
+              <input type="url" id="tg-worker-url" class="form-control" placeholder="https://lab-checkin-bot.<sub>.workers.dev">
+            </div>
+            <div class="form-group">
+              <label for="tg-notify-secret">NOTIFY_SECRET (opcional — notificação via worker, sem bot_token no config)</label>
+              <input type="password" id="tg-notify-secret" class="form-control" placeholder="Deixe vazio para notificar direto pelo Telegram">
+            </div>
+            <div class="row" style="gap: 8px;">
+              <div class="col">
+                <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-tg-connect">
+                  <span class="spinner hidden" id="tg-connect-spinner"></span>
+                  🔗 Conectar Telegram
+                </button>
+              </div>
+              <div class="col">
+                <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-tg-test">
+                  <span class="spinner hidden" id="tg-test-spinner"></span>
+                  🧪 Enviar teste
+                </button>
+              </div>
+            </div>
           </div>
 
           <!-- Preferencias + Modo automatico -->

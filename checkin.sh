@@ -24,6 +24,21 @@
 #
 #   ./checkin.sh auto [--initiative ID] [--dry-run]
 #       Preenche o check-in automaticamente buscando atividades do Jira/Bitbucket.
+#       Com initiative_config no config.json, roteia a atividade por iniciativa
+#       (project key do Jira / repo do Bitbucket) e faz um submit por iniciativa
+#       com atividade; o --initiative e a iniciativa padrao (atividade nao
+#       mapeada + dia sem atividade). Sem initiative_config, um unico submit.
+#       Respeita schedule.enabled/schedule.time do config.json (modelo tick).
+#
+#   ./checkin.sh pular DD/MM      (ou hoje/amanha/YYYY-MM-DD)
+#       Cancela o check-in local de uma data (arquivo .skips.json), sem Telegram.
+#   ./checkin.sh retomar DD/MM    Desfaz um skip local.
+#   ./checkin.sh pulos            Lista os skips locais agendados.
+#
+#   ./checkin.sh repos [PADRAO]
+#       Confirmacao (so leitura): lista os repos do workspace que casam com o
+#       PADRAO (regex/substring). Sem PADRAO, usa o bitbucket.repositories do
+#       config.json. Util para validar o filtro antes de deixar a cron rodar.
 
 set -Eeuo pipefail
 
@@ -32,29 +47,54 @@ ENDPOINT="$BASE_URL/saude-entrega/daily"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JAR="$DIR/cookies.txt"
 CONFIG="$DIR/config.json"
+SKIPS_FILE="$DIR/.skips.json"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
-[ -f "$JAR" ] || { echo "ERRO: $JAR nao existe (cookie remember_web necessario)" >&2; exit 1; }
+# Só os comandos que falam com o Lab (status/submit/auto) exigem o cookie;
+# pular/retomar/pulos mexem so no arquivo local .skips.json.
+require_jar() {
+    [ -f "$JAR" ] || { echo "ERRO: $JAR nao existe (cookie remember_web necessario)" >&2; exit 1; }
+}
 
 notify() {
-    # Envia mensagem pro Telegram se telegram.bot_token/chat_id estiverem no
-    # config.json; sem configuracao, nao faz nada (fluxo dos demais devs intacto).
-    local text="$1" creds token chat_id
+    # Notifica o desfecho. Preferencia (Fase 5b): se notify.url + notify.secret
+    # estiverem no config.json, manda pro worker /notify (o bot_token sai do
+    # config do dev). Senao, se telegram.bot_token/chat_id existirem, fala direto
+    # com o Telegram. Sem nada configurado, nao faz nada (fluxo dos demais devs
+    # intacto).
+    local text="$1" fields notify_url notify_secret token chat_id
     [ -f "$CONFIG" ] || return 0
-    creds="$(python3 -c '
+    fields="$(python3 -c '
 import json, sys
 try:
-    t = json.load(open(sys.argv[1])).get("telegram", {})
-    tok, chat = t.get("bot_token", ""), str(t.get("chat_id", ""))
-    if tok and chat:
-        print(tok)
-        print(chat)
+    c = json.load(open(sys.argv[1]))
 except Exception:
-    pass
+    sys.exit(0)
+n = c.get("notify", {}) or {}
+t = c.get("telegram", {}) or {}
+print(n.get("url", ""))
+print(n.get("secret", ""))
+print(t.get("bot_token", ""))
+print(str(t.get("chat_id", "")))
 ' "$CONFIG")" || return 0
-    [ -n "$creds" ] || return 0
-    token="$(sed -n 1p <<<"$creds")"
-    chat_id="$(sed -n 2p <<<"$creds")"
+    notify_url="$(sed -n 1p <<<"$fields")"
+    notify_secret="$(sed -n 2p <<<"$fields")"
+    token="$(sed -n 3p <<<"$fields")"
+    chat_id="$(sed -n 4p <<<"$fields")"
+
+    if [ -n "$notify_url" ] && [ -n "$notify_secret" ] && [ -n "$chat_id" ]; then
+        local payload
+        payload="$(python3 -c 'import json,sys; print(json.dumps({"chatId": int(sys.argv[1]), "text": sys.argv[2]}))' "$chat_id" "$text")"
+        if curl -sf -o /dev/null --max-time 10 \
+            -H "content-type: application/json" \
+            -H "x-notify-secret: ${notify_secret}" \
+            --data-raw "$payload" \
+            "${notify_url%/}/notify"; then
+            return 0
+        fi
+        # falha no worker: cai no envio direto abaixo se houver bot_token
+    fi
+    [ -n "$token" ] && [ -n "$chat_id" ] || return 0
     curl -s -o /dev/null --max-time 10 \
         "https://api.telegram.org/bot${token}/sendMessage" \
         -d chat_id="${chat_id}" \
@@ -168,15 +208,134 @@ sys.exit(0 if auto_activity.is_holiday(today) else 1)
 "
 }
 
+# Skip LOCAL (arquivo .skips.json) — alternativa ao /pular do Telegram para
+# quem roda so no CLI/cron, sem depender do bot. Formato:
+#   {"skips": ["YYYY-MM-DD", ...]}
+is_locally_skipped() {
+    [ -f "$SKIPS_FILE" ] || return 1
+    python3 -c '
+import json, sys, datetime
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if datetime.date.today().isoformat() in (data.get("skips") or []) else 1)
+' "$SKIPS_FILE"
+}
+
+# skip_tool <add|remove|list> [data] — gerencia o .skips.json (datas locais).
+skip_tool() {
+    python3 - "$SKIPS_FILE" "$@" <<'PY'
+import json, sys, datetime, re
+path = sys.argv[1]
+action = sys.argv[2] if len(sys.argv) > 2 else "list"
+raw = (sys.argv[3] if len(sys.argv) > 3 else "").strip().lower()
+today = datetime.date.today()
+
+def parse(s):
+    if s == "hoje": return today
+    if s in ("amanha", "amanhã"): return today + datetime.timedelta(days=1)
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try: return datetime.date(int(m[1]), int(m[2]), int(m[3]))
+        except ValueError: return None
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", s)
+    if not m: return None
+    day, mon = int(m[1]), int(m[2])
+    year = int(m[3]) if m[3] else today.year
+    if year < 100: year += 2000
+    try: d = datetime.date(year, mon, day)
+    except ValueError: return None
+    if not m[3] and d < today: d = datetime.date(year + 1, mon, day)
+    return d
+
+try:
+    skips = set(json.load(open(path)).get("skips") or [])
+except Exception:
+    skips = set()
+skips = {s for s in skips if s >= today.isoformat()}  # limpa passado
+
+if action == "list":
+    print("Skips locais: " + (", ".join(sorted(skips)) if skips else "nenhum"))
+    sys.exit(0)
+
+d = parse(raw)
+if not d:
+    print("ERRO: nao entendi a data (use DD/MM, hoje, amanha ou YYYY-MM-DD)", file=sys.stderr)
+    sys.exit(1)
+iso = d.isoformat()
+if action == "add":
+    if d < today:
+        print(f"ERRO: {iso} ja passou.", file=sys.stderr); sys.exit(1)
+    skips.add(iso)
+    msg = f"🚫 Check-in local de {iso} sera pulado. Desfaz com: checkin.sh retomar {d:%d/%m}"
+elif action == "remove":
+    if iso not in skips:
+        print(f"{iso} nao estava na lista de skips locais."); sys.exit(0)
+    skips.discard(iso)
+    msg = f"✅ Skip local de {iso} removido — o check-in volta ao normal nesse dia."
+else:
+    print(f"ERRO: acao desconhecida: {action}", file=sys.stderr); sys.exit(1)
+
+json.dump({"skips": sorted(skips)}, open(path, "w"))
+print(msg)
+PY
+}
+
+cmd_pular() {
+    [ -n "${1:-}" ] || { echo "ERRO: uso: checkin.sh pular DD/MM (ou hoje/amanha/YYYY-MM-DD)" >&2; exit 1; }
+    skip_tool add "$1"
+}
+
+cmd_retomar() {
+    [ -n "${1:-}" ] || { echo "ERRO: uso: checkin.sh retomar DD/MM" >&2; exit 1; }
+    skip_tool remove "$1"
+}
+
+cmd_pulos() { skip_tool list; }
+
+# Confirmacao de repositorios (so leitura) — delega ao auto_activity.py.
+cmd_repos() { python3 "$DIR/auto_activity.py" --list-repos "$@"; }
+
+# Gate de agendamento (modelo tick): a crontab roda de X em X minutos; so
+# prossegue se schedule.enabled != false E (schedule.time vazio OU horario
+# atual >= schedule.time). Torna a cron idempotente e resolve maquina desligada
+# no horario exato (o proximo tick apos o boot envia). Sem bloco schedule (ou
+# time vazio), sempre prossegue. Codigos: 0=ok, 2=pausado, 3=antes do horario.
+schedule_gate() {
+    [ -f "$CONFIG" ] || return 0
+    python3 -c '
+import json, sys, datetime
+try:
+    s = json.load(open(sys.argv[1])).get("schedule", {}) or {}
+except Exception:
+    sys.exit(0)
+if s.get("enabled") is False:
+    sys.exit(2)
+t = (s.get("time") or "").strip()
+if t and datetime.datetime.now().strftime("%H:%M") < t:
+    sys.exit(3)
+sys.exit(0)
+' "$CONFIG"
+}
+
 cmd_auto() {
-    local initiative=6 dry_run=false
+    local initiative=6 dry_run=false force=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --initiative) initiative="$2"; shift 2 ;;
             --dry-run)    dry_run=true;     shift ;;
+            --force)      force=true;       shift ;;
             *) echo "ERRO: opcao desconhecida: $1" >&2; exit 1 ;;
         esac
     done
+
+    # 0. Gate de agendamento (modelo tick) — nao aplica em dry-run nem --force.
+    if [ "$dry_run" != "true" ] && [ "$force" != "true" ]; then
+        local gate=0; schedule_gate || gate=$?
+        if [ "$gate" -eq 2 ]; then echo "schedule.enabled=false — automatico pausado."; return 0; fi
+        if [ "$gate" -eq 3 ]; then echo "Ainda antes do schedule.time configurado. Pulando este tick."; return 0; fi
+    fi
 
     NOTIFY_ON_ERR=true
 
@@ -194,44 +353,77 @@ cmd_auto() {
     fi
 
     # 2b. Ignora se o dia foi cancelado via /pular (mensagem fixada no Telegram)
+    #     ou via skip local (checkin.sh pular / arquivo .skips.json).
+    if is_locally_skipped; then
+        echo "Check-in de hoje cancelado via skip local (.skips.json). Pulando."
+        notify "🚫 lab-checkin: check-in de hoje NAO enviado — skip local. Para desfazer: checkin.sh retomar hoje"
+        return 0
+    fi
     if is_skipped; then
         echo "Check-in de hoje cancelado via /pular (mensagem fixada no Telegram). Pulando."
         notify "🚫 lab-checkin: check-in de hoje NAO enviado — cancelado via /pular. Para desfazer: /retomar hoje"
         return 0
     fi
 
-    # 3. Ignora se ja foi preenchido
-    if is_submitted "$initiative"; then
-        echo "Check-in para iniciativa $initiative ja preenchido hoje. Pulando."
+    # 3. Coleta atividade, roteada por iniciativa quando initiative_config estiver
+    #    configurado (senao, um unico check-in na iniciativa padrao). A guarda de
+    #    "ja preenchido" passa a ser por iniciativa, dentro do loop abaixo.
+    local json_output; json_output="$(python3 "$DIR/auto_activity.py" --default-initiative "$initiative")"
+
+    # Aviso de roteamento (atividade sem mapeamento -> iniciativa padrao)
+    local warnings; warnings="$(echo "$json_output" | python3 -c '
+import sys, json
+for w in json.load(sys.stdin).get("warnings", []):
+    print(w)
+')"
+    if [ -n "$warnings" ]; then
+        echo "$warnings"
+        [ "$dry_run" = "true" ] || notify "⚠️ lab-checkin: $warnings"
+    fi
+
+    local count; count="$(echo "$json_output" | python3 -c 'import sys, json; print(len(json.load(sys.stdin).get("checkins", [])))')"
+    if [ "$count" -eq 0 ]; then
+        echo "Nenhuma atividade para enviar hoje. Nenhum check-in enviado."
+        NOTIFY_ON_ERR=false
         return 0
     fi
 
-    # 4. Coleta atividade
-    local json_output; json_output="$(python3 "$DIR/auto_activity.py")"
-    local yesterday; yesterday="$(echo "$json_output" | python3 -c 'import sys, json; print(json.load(sys.stdin)["yesterday"])')"
-    local today; today="$(echo "$json_output" | python3 -c 'import sys, json; print(json.load(sys.stdin)["today"])')"
+    # 4. Um submit por iniciativa com atividade
+    local i=0
+    while [ "$i" -lt "$count" ]; do
+        local init yesterday today
+        init="$(echo "$json_output" | python3 -c 'import sys, json; print(json.load(sys.stdin)["checkins"]['"$i"']["initiative"])')"
+        yesterday="$(echo "$json_output" | python3 -c 'import sys, json; print(json.load(sys.stdin)["checkins"]['"$i"']["yesterday"])')"
+        today="$(echo "$json_output" | python3 -c 'import sys, json; print(json.load(sys.stdin)["checkins"]['"$i"']["today"])')"
+        i=$((i + 1))
 
-    if [ "$dry_run" = "true" ]; then
-        echo "=== DRY RUN (Iniciativa $initiative) ==="
-        echo "ONTEM (Yesterday):"
-        echo "$yesterday"
-        echo "------------------"
-        echo "HOJE (Today):"
-        echo "$today"
-        return 0
-    fi
+        if [ "$dry_run" = "true" ]; then
+            echo "=== DRY RUN (Iniciativa $init) ==="
+            echo "ONTEM (Yesterday):"
+            echo "$yesterday"
+            echo "------------------"
+            echo "HOJE (Today):"
+            echo "$today"
+            echo
+            continue
+        fi
 
-    # 5. Envia
-    cmd_submit --yesterday "$yesterday" --today "$today" --initiative "$initiative"
+        if is_submitted "$init"; then
+            echo "Check-in para iniciativa $init ja preenchido hoje. Pulando."
+            continue
+        fi
 
-    NOTIFY_ON_ERR=false
-    notify "✅ Check-in enviado — iniciativa $initiative ($(date +%F))
+        cmd_submit --yesterday "$yesterday" --today "$today" --initiative "$init"
+        notify "✅ Check-in enviado — iniciativa $init ($(date +%F))
 
 Ontem:
 $yesterday
 
 Hoje:
 $today"
+    done
+
+    NOTIFY_ON_ERR=false
 }
 
 cmd_submit() {
@@ -301,8 +493,12 @@ PY
 }
 
 case "${1:-}" in
-    status) shift; cmd_status "$@" ;;
-    submit) shift; cmd_submit "$@" ;;
-    auto)   shift; cmd_auto "$@" ;;
+    status)  shift; require_jar; cmd_status "$@" ;;
+    submit)  shift; require_jar; cmd_submit "$@" ;;
+    auto)    shift; require_jar; cmd_auto "$@" ;;
+    pular)   shift; cmd_pular "$@" ;;
+    retomar) shift; cmd_retomar "$@" ;;
+    pulos)   shift; cmd_pulos "$@" ;;
+    repos)   shift; cmd_repos "$@" ;;
     *) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -25; exit 1 ;;
 esac

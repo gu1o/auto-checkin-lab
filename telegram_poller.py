@@ -21,6 +21,7 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -30,6 +31,7 @@ import zoneinfo
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(DIR, "config.json")
+CHECKIN_PATH = os.path.join(DIR, "checkin.sh")
 STATE_PATH = os.path.join(DIR, ".poller_state.json")
 SP = zoneinfo.ZoneInfo("America/Sao_Paulo")
 SKIP_MARKER = "SKIP:"
@@ -41,6 +43,12 @@ HELP = (
     "/pular DD/MM — cancela direto para a data\n"
     "/retomar DD/MM — desfaz um cancelamento\n"
     "/pulos — lista os cancelamentos agendados\n"
+    "/status — estado do check-in de hoje + agendamento\n"
+    "/horario HH:MM — define o horario do check-in automatico\n"
+    "/pausar — pausa o check-in automatico (schedule.enabled=false)\n"
+    "/ativar — reativa o check-in automatico\n"
+    "/agora — roda o check-in agora (ignora o horario)\n"
+    "/dryrun — mostra o rascunho sem enviar\n"
     "/cancelar — aborta a pergunta em andamento"
 )
 
@@ -213,6 +221,76 @@ def do_pulos():
              + ", ".join(fmt(datetime.date.fromisoformat(x)) for x in dates))
 
 
+# --- agendamento (schedule) + execucao do checkin.sh (Func.2) ----------------
+
+def load_full_config():
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def set_schedule(**changes):
+    cfg = load_full_config()
+    sched = cfg.get("schedule") or {}
+    sched.update(changes)
+    cfg["schedule"] = sched
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    return sched
+
+
+def run_checkin(args, timeout=180):
+    try:
+        p = subprocess.run(
+            ["bash", CHECKIN_PATH, *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        out = (p.stdout + p.stderr).strip()
+        return out or "(sem saida)"
+    except Exception as e:  # noqa: BLE001
+        return f"ERRO ao rodar checkin.sh: {e}"
+
+
+def do_status():
+    s = (load_full_config().get("schedule") or {})
+    enabled = s.get("enabled", True)
+    hhmm = s.get("time") or "(nao definido)"
+    out = run_checkin(["status"])
+    send(f"⏰ Agendamento: {'ativo' if enabled else 'PAUSADO'}, horario {hhmm}\n\n{out}")
+
+
+def do_horario(arg):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", arg.strip())
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        send("Formato invalido. Use /horario HH:MM (ex: 09:30).")
+        return
+    hhmm = f"{int(m[1]):02d}:{m[2]}"
+    set_schedule(time=hhmm)
+    send(f"✅ Horario do check-in automatico atualizado para {hhmm}.")
+    log(f"schedule.time -> {hhmm}")
+
+
+def do_pausar():
+    set_schedule(enabled=False)
+    send("⏸️ Check-in automatico pausado. Reative com /ativar.")
+    log("schedule.enabled -> False")
+
+
+def do_ativar():
+    set_schedule(enabled=True)
+    send("▶️ Check-in automatico reativado.")
+    log("schedule.enabled -> True")
+
+
+def do_agora():
+    send("Rodando o check-in agora (ignorando o horario)...")
+    send(run_checkin(["auto", "--force"]))
+
+
+def do_dryrun():
+    send("Gerando o rascunho (sem enviar)...")
+    send(run_checkin(["auto", "--dry-run"]))
+
+
 # --- loop principal ----------------------------------------------------------
 
 pending = None  # 'pular' quando aguardando a data
@@ -248,6 +326,24 @@ def handle_text(text):
     elif low.startswith("/pulos"):
         pending = None
         do_pulos()
+    elif low.startswith("/status"):
+        pending = None
+        do_status()
+    elif low.startswith("/horario"):
+        pending = None
+        do_horario(t[len("/horario"):].strip())
+    elif low.startswith("/pausar"):
+        pending = None
+        do_pausar()
+    elif low.startswith("/ativar"):
+        pending = None
+        do_ativar()
+    elif low.startswith("/agora"):
+        pending = None
+        do_agora()
+    elif low.startswith("/dryrun"):
+        pending = None
+        do_dryrun()
     elif low.startswith("/cancelar"):
         pending = None
         send("Ok, deixa pra la.")
@@ -291,6 +387,12 @@ def main():
         {"command": "pular", "description": "Cancelar o check-in automatico de um dia"},
         {"command": "retomar", "description": "Desfazer um cancelamento (/retomar DD/MM)"},
         {"command": "pulos", "description": "Listar cancelamentos agendados"},
+        {"command": "status", "description": "Estado do check-in de hoje + agendamento"},
+        {"command": "horario", "description": "Definir horario do automatico (/horario HH:MM)"},
+        {"command": "pausar", "description": "Pausar o check-in automatico"},
+        {"command": "ativar", "description": "Reativar o check-in automatico"},
+        {"command": "agora", "description": "Rodar o check-in agora"},
+        {"command": "dryrun", "description": "Mostrar o rascunho sem enviar"},
     ])})
     state = load_state()
     offset = state.get("offset")

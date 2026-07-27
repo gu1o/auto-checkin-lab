@@ -8,7 +8,7 @@ credenciais são as mesmas, só muda onde o fluxo roda):
 | Modo | Onde roda | Melhor para quem... | Precisa de |
 |---|---|---|---|
 | **A. Extensão do Chrome** | No seu navegador | Quer **revisar/editar** o texto antes de enviar, ou quer o automático sem mexer em terminal (basta o Chrome aberto) | Tokens Jira/Bitbucket, key de IA; sessão do Lab vem do próprio navegador (sem cookie manual) |
-| **B. Rotina no Claude Code** | Na nuvem (claude.ai), na **sua** conta corporativa | Quer 100% automático, sem depender de máquina ligada ou navegador aberto | Tokens Jira/Bitbucket, cookie `remember_web`, assento corporativo do Claude |
+| **B. Rotina no Claude Code** | Na nuvem (claude.ai), na **sua** conta corporativa | Quer 100% automático, sem depender de máquina ligada ou navegador aberto | Tokens Jira/Bitbucket, cookie `remember_web`, assento corporativo do Claude — ou, sem token do Jira, os conectores **Atlassian** e **Ideal Lab** ligados na sua conta (modo A da skill `/setup-checkin`; o cookie continua necessário para enviar) |
 | **C. CLI + cron local** | Na sua máquina (WSL/Linux) | Já vive no terminal e a máquina fica ligada no horário | Tokens Jira/Bitbucket, key de IA, cookie `remember_web` |
 
 > Os modos não conflitam: todos respeitam as mesmas guardas (fim de semana,

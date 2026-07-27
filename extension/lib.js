@@ -115,6 +115,7 @@ function buildConfigJson(cfg, labCookie) {
       username: cfg.bbUsername || '',
       app_password: '',
       workspace: cfg.bbWorkspace || '',
+      project_key: cfg.bbProjectKey || '',
       repositories: [...allRepos]
     },
     llm_provider: cfg.llmProvider || 'gemini',
@@ -124,6 +125,14 @@ function buildConfigJson(cfg, labCookie) {
       bot_token: cfg.tgBotToken || '',
       chat_id: cfg.tgChatId || '',
       webhook_secret: ''
+    },
+    notify: {
+      url: cfg.notifyUrl || '',
+      secret: cfg.notifySecret || ''
+    },
+    schedule: {
+      time: cfg.autoTime || '',
+      enabled: cfg.autoEnabled !== false
     },
     lab: {
       cookie_name: labCookie?.name || '',
@@ -213,17 +222,13 @@ async function fetchBitbucket(cfg, sinceStr, reposOverride) {
 
   const headers = bbHeaders(cfg);
 
+  // Precedencia: `repositories` explicito > `project_key` > todos (paginado).
   let repos = reposOverride;
   if (!repos) {
     if (cfg.bbRepos) {
       repos = cfg.bbRepos.split(',').map(r => r.trim());
     } else {
-      const reposUrl = `https://api.bitbucket.org/2.0/repositories/${cfg.bbWorkspace}?pagelen=100`;
-      const res = await fetch(reposUrl, { headers });
-      if (res.ok) {
-        const data = await res.json();
-        repos = (data.values || []).map(r => r.slug).filter(Boolean);
-      }
+      repos = await listWorkspaceRepos(cfg, headers);
     }
   }
 
@@ -285,13 +290,34 @@ async function fetchJiraProjects(cfg) {
   return await res.json();
 }
 
+// Lista repos do workspace paginando o campo `next` (>100 repos eram
+// truncados). Se `cfg.bbProjectKey` estiver setado, filtra por project.
+async function listWorkspaceRepos(cfg, headers) {
+  const base = `https://api.bitbucket.org/2.0/repositories/${cfg.bbWorkspace}?pagelen=100`;
+  const q = cfg.bbProjectKey
+    ? `&q=${encodeURIComponent(`project.key="${cfg.bbProjectKey}"`)}`
+    : '';
+  const repos = [];
+  let url = base + q;
+  let page = 0;
+  while (url && page < 50) {  // teto de seguranca contra loop
+    const res = await fetch(url, { headers });
+    if (!res.ok) break;
+    const data = await res.json();
+    for (const r of data.values || []) {
+      if (r.slug) repos.push(r.slug);
+    }
+    url = data.next || null;
+    page++;
+  }
+  return repos;
+}
+
 async function fetchBitbucketRepos(cfg) {
-  const url = `https://api.bitbucket.org/2.0/repositories/${cfg.bbWorkspace}?pagelen=100`;
   const headers = bbHeaders(cfg);
-  const res = await fetch(url, { headers });
-  if (!res.ok) throw new Error('Bitbucket API error: ' + res.statusText);
-  const data = await res.json();
-  return (data.values || []).map(r => r.slug).filter(Boolean);
+  const repos = await listWorkspaceRepos(cfg, headers);
+  if (!repos.length) throw new Error('Bitbucket API error ou nenhum repo encontrado');
+  return repos;
 }
 
 function normalizeStr(s) {
@@ -523,6 +549,21 @@ async function submitCheckin({ initiative, yesterday, today, confidence = 5, blo
 // --- Telegram (notificacoes + /pular) ----------------------------------------------
 
 async function telegramNotify(cfg, text) {
+  // Fase 5b: se o worker /notify estiver configurado, usa ele (o bot_token sai
+  // dos configs dos devs — um segredo so, no worker). Senao, fala direto com o
+  // Telegram. Nunca bloqueia o fluxo.
+  if (cfg.notifyUrl && cfg.notifySecret && cfg.tgChatId) {
+    try {
+      const res = await fetch(cfg.notifyUrl.replace(/\/$/, '') + '/notify', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-notify-secret': cfg.notifySecret },
+        body: JSON.stringify({ chatId: Number(cfg.tgChatId), text })
+      });
+      if (res.ok) return;
+    } catch (err) {
+      // cai no fallback direto abaixo
+    }
+  }
   if (!cfg.tgBotToken || !cfg.tgChatId) return;
   try {
     await fetch(`https://api.telegram.org/bot${cfg.tgBotToken}/sendMessage`, {
@@ -533,6 +574,49 @@ async function telegramNotify(cfg, text) {
   } catch (err) {
     // Notificacao nunca bloqueia o fluxo.
   }
+}
+
+// --- Canal alternativo: notificacao do navegador + skip local (Fase 5a) --------
+
+// Notificacao nativa do Chrome (nao depende de Telegram). Zero infra.
+function notifyBrowser(title, message) {
+  try {
+    if (!chrome.notifications) return;
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icon.png',
+      title,
+      message: (message || '').slice(0, 300),
+      buttons: [{ title: 'Pular amanhã' }],
+      priority: 1
+    });
+  } catch (err) {
+    // notificacao nunca bloqueia o fluxo
+  }
+}
+
+// Skips locais no storage do navegador — alternativa ao /pular do Telegram.
+async function getLocalSkips() {
+  const data = await chrome.storage.local.get(['skips']);
+  const today = localIsoDate();
+  return (data.skips || []).filter(d => d >= today).sort();
+}
+
+async function addLocalSkip(iso) {
+  const skips = await getLocalSkips();
+  if (!skips.includes(iso)) skips.push(iso);
+  await chrome.storage.local.set({ skips: skips.sort() });
+  return skips;
+}
+
+async function removeLocalSkip(iso) {
+  const skips = (await getLocalSkips()).filter(d => d !== iso);
+  await chrome.storage.local.set({ skips });
+  return skips;
+}
+
+async function isLocallySkippedToday() {
+  return (await getLocalSkips()).includes(localIsoDate());
 }
 
 // Le a mensagem fixada do chat com o bot ("SKIP: YYYY-MM-DD, ...") — o mesmo
@@ -553,13 +637,84 @@ async function telegramIsSkippedToday(cfg) {
   }
 }
 
+// --- Roteamento multi-iniciativa (Fase 4) --------------------------------------------
+
+const PROJECT_KEY_RE = /\b([A-Z][A-Z0-9]+)-\d+\b/;
+
+function splitCsv(value) {
+  return String(value || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// Particiona a atividade por iniciativa segundo o initiative_config
+// ({repos: {id: "repoA, repoB"}, projects: {id: "AUD, SI"}}). Espelha
+// route_activity do auto_activity.py: issue do Jira pela project key
+// (prefixo de KEY-123); commit pelo repo, com fallback para a project key na
+// mensagem. Atividade sem mapeamento cai na iniciativa padrao com aviso.
+// Retorna { buckets: {initId: {jira, bb}}, warnings: [] }.
+function routeActivity(jiraAct, bbAct, initiativeConfig, defaultInitiative) {
+  const cfg = initiativeConfig || {};
+  const reposMap = cfg.repos || {};
+  const projectsMap = cfg.projects || {};
+
+  const projToInit = {};
+  for (const [initId, val] of Object.entries(projectsMap)) {
+    for (const pk of splitCsv(val)) projToInit[pk.toUpperCase()] = Number(initId);
+  }
+  const repoToInit = {};
+  for (const [initId, val] of Object.entries(reposMap)) {
+    for (const repo of splitCsv(val)) repoToInit[repo.toLowerCase()] = Number(initId);
+  }
+
+  const buckets = {};
+  const bucket = (id) => (buckets[id] = buckets[id] || { jira: [], bb: [] });
+
+  const unmappedJira = [];
+  const unmappedBb = [];
+
+  for (const item of jiraAct) {
+    const key = item.key || '';
+    const pk = key.includes('-') ? key.split('-')[0].toUpperCase() : '';
+    const initId = projToInit[pk];
+    if (initId !== undefined) bucket(initId).jira.push(item);
+    else unmappedJira.push(item);
+  }
+
+  for (const c of bbAct) {
+    let initId = repoToInit[(c.repo || '').toLowerCase()];
+    if (initId === undefined) {
+      const m = PROJECT_KEY_RE.exec(c.message || '');
+      if (m) initId = projToInit[m[1].toUpperCase()];
+    }
+    if (initId !== undefined) bucket(initId).bb.push(c);
+    else unmappedBb.push(c);
+  }
+
+  const warnings = [];
+  const unkProjects = [...new Set(unmappedJira
+    .map(i => (i.key || '').includes('-') ? i.key.split('-')[0].toUpperCase() : '')
+    .filter(Boolean))].sort();
+  const unkRepos = [...new Set(unmappedBb.map(c => c.repo || '').filter(Boolean))].sort();
+  if (unmappedJira.length || unmappedBb.length) {
+    const b = bucket(defaultInitiative);
+    b.jira.push(...unmappedJira);
+    b.bb.push(...unmappedBb);
+    const parts = [];
+    if (unkProjects.length) parts.push('projetos ' + unkProjects.join(', '));
+    if (unkRepos.length) parts.push('repos ' + unkRepos.join(', '));
+    const detail = parts.length ? ` (${parts.join('; ')})` : '';
+    warnings.push(`Atividade nao mapeada${detail} roteada para a iniciativa padrao ${defaultInitiative}. Ajuste o mapeamento nas Configurações.`);
+  }
+
+  return { buckets, warnings, unmapped: { projects: unkProjects, repos: unkRepos } };
+}
+
 // --- Modo automatico (Fase 5) --------------------------------------------------------
 
 // Fluxo completo do alarme diario: mesmas guardas do cmd_auto do checkin.sh.
 // Retorna { status, detail } e notifica via Telegram quando configurado.
 async function runAutoCheckin() {
   const cfg = await loadConfigData();
-  const initiative = Number(cfg.defaultInitiative) || 6;
+  const defaultInitiative = Number(cfg.defaultInitiative) || 6;
   const now = new Date();
 
   // 1. Fim de semana
@@ -572,7 +727,11 @@ async function runAutoCheckin() {
     return { status: 'skipped', detail: 'feriado' };
   }
 
-  // 3. /pular (mensagem fixada no Telegram)
+  // 3. /pular (mensagem fixada no Telegram) ou skip local (storage)
+  if (await isLocallySkippedToday()) {
+    notifyBrowser('lab-checkin', '🚫 Check-in de hoje pulado (skip local).');
+    return { status: 'skipped', detail: 'skip local' };
+  }
   if (await telegramIsSkippedToday(cfg)) {
     await telegramNotify(cfg, '🚫 lab-checkin (extensão): check-in de hoje NAO enviado — cancelado via /pular. Para desfazer: /retomar hoje');
     return { status: 'skipped', detail: 'cancelado via /pular' };
@@ -582,46 +741,68 @@ async function runAutoCheckin() {
   const remember = await getRememberCookie();
   if (!remember) {
     await telegramNotify(cfg, '❌ lab-checkin (extensão): sessão do Lab expirada — faça login em lab.idealtrends.io para o check-in automático voltar a funcionar.');
+    notifyBrowser('lab-checkin — sessão expirada', 'Faça login em lab.idealtrends.io para o check-in automático voltar a funcionar.');
     return { status: 'error', detail: 'sessao expirada' };
   }
 
-  // 5. Ja preenchido?
-  let submitted;
   try {
-    submitted = await isSubmittedToday(initiative);
-  } catch (err) {
-    await telegramNotify(cfg, '❌ lab-checkin (extensão): ' + err.message);
-    return { status: 'error', detail: err.message };
-  }
-  if (submitted) {
-    return { status: 'skipped', detail: 'ja preenchido hoje' };
-  }
-
-  try {
-    // 6. Coleta + geracao
+    // 5. Coleta (ampla) + roteamento por iniciativa
     const sinceDate = getLastBusinessDay();
     const sinceStr = localIsoDate(sinceDate);
-    const initiativeCfg = cfg.initiativeConfig || {};
-    const oldRepos = cfg.initiativeRepos || {};
-    const projectKeys = (initiativeCfg.projects || {})[String(initiative)];
-    const jiraAct = cfg.jiraUrl && cfg.jiraEmail && cfg.jiraToken ? await fetchJira(cfg, sinceStr, projectKeys) : [];
-    const repos = (initiativeCfg.repos || oldRepos)[String(initiative)];
-    const bbRepos = repos ? repos.split(',').map(r => r.trim()) : undefined;
-    const bbAct = await fetchBitbucket(cfg, sinceStr, bbRepos);
+    const yesterdayIsHoliday = isHoliday(sinceDate);
+    const initiativeCfg = { ...(cfg.initiativeConfig || {}) };
+    // compat: mapa antigo de repos por iniciativa
+    if (!initiativeCfg.repos && cfg.initiativeRepos) initiativeCfg.repos = cfg.initiativeRepos;
+    const reposMap = initiativeCfg.repos || {};
+    const projectsMap = initiativeCfg.projects || {};
+    const hasMap = Object.keys(reposMap).length > 0 || Object.keys(projectsMap).length > 0;
+
+    const jiraAct = cfg.jiraUrl && cfg.jiraEmail && cfg.jiraToken ? await fetchJira(cfg, sinceStr) : [];
+    const bbAct = await fetchBitbucket(cfg, sinceStr);
+
+    // Monta o plano de check-ins (um por iniciativa com atividade).
+    let plan;
+    if (!hasMap) {
+      // Mapa vazio: comportamento atual — um check-in na iniciativa padrao.
+      plan = [{ initiative: defaultInitiative, jira: jiraAct, bb: bbAct }];
+    } else {
+      const { buckets, warnings } = routeActivity(jiraAct, bbAct, initiativeCfg, defaultInitiative);
+      for (const w of warnings) await telegramNotify(cfg, '⚠️ lab-checkin (extensão): ' + w);
+      plan = Object.keys(buckets)
+        .map(Number)
+        .sort((a, b) => a - b)
+        .map(id => ({ initiative: id, jira: buckets[id].jira, bb: buckets[id].bb }))
+        .filter(p => p.jira.length || p.bb.length);
+      // Dia sem atividade mapeada: garante o check-in da iniciativa padrao.
+      if (!plan.length) plan = [{ initiative: defaultInitiative, jira: [], bb: [] }];
+    }
+
     const allInitiatives = await fetchInitiatives();
-    const initiativeName = (allInitiatives.find(i => i.id === initiative)?.name) || String(initiative);
-    const draft = await generateDraft(cfg, jiraAct, bbAct, initiativeName);
-    let yesterdayTxt = draft.yesterday;
-    const todayTxt = draft.today;
-    if (isHoliday(sinceDate)) yesterdayTxt = '';
+    const nameOf = (id) => (allInitiatives.find(i => i.id === id)?.name) || String(id);
 
-    // 7. Envio
-    await submitCheckin({ initiative, yesterday: yesterdayTxt, today: todayTxt });
+    // 6. Um submit por iniciativa (pula as ja preenchidas hoje)
+    const sent = [];
+    let skippedFilled = 0;
+    for (const p of plan) {
+      if (await isSubmittedToday(p.initiative)) { skippedFilled++; continue; }
+      const draft = await generateDraft(cfg, p.jira, p.bb, nameOf(p.initiative));
+      let yesterdayTxt = draft.yesterday;
+      const todayTxt = draft.today;
+      if (yesterdayIsHoliday) yesterdayTxt = '';
+      await submitCheckin({ initiative: p.initiative, yesterday: yesterdayTxt, today: todayTxt });
+      await telegramNotify(cfg, `✅ Check-in enviado (extensão) — iniciativa ${p.initiative} (${localIsoDate()})\n\nOntem:\n${yesterdayTxt || '(vazio)'}\n\nHoje:\n${todayTxt}`);
+      sent.push(p.initiative);
+    }
 
-    await telegramNotify(cfg, `✅ Check-in enviado (extensão) — iniciativa ${initiative} (${localIsoDate()})\n\nOntem:\n${yesterdayTxt || '(vazio)'}\n\nHoje:\n${todayTxt}`);
-    return { status: 'sent', detail: `iniciativa ${initiative}` };
+    if (sent.length) {
+      notifyBrowser('lab-checkin ✅', `Check-in enviado — iniciativa(s) ${sent.join(', ')}.`);
+      return { status: 'sent', detail: `iniciativa(s) ${sent.join(', ')}` };
+    }
+    if (skippedFilled) return { status: 'skipped', detail: 'ja preenchido hoje' };
+    return { status: 'skipped', detail: 'sem atividade' };
   } catch (err) {
     await telegramNotify(cfg, '❌ lab-checkin (extensão): falha no check-in automático — ' + err.message);
+    notifyBrowser('lab-checkin ❌', 'Falha no check-in automático — ' + err.message);
     return { status: 'error', detail: err.message };
   }
 }

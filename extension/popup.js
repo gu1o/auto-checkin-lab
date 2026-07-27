@@ -74,12 +74,15 @@ document.getElementById('config-form').addEventListener('submit', (e) => {
     bbToken: document.getElementById('bb-token').value.trim(),
     bbUsername: document.getElementById('bb-username').value.trim(),
     bbWorkspace: document.getElementById('bb-workspace').value.trim(),
+    bbProjectKey: document.getElementById('bb-project-key').value.trim(),
     initiativeConfig: readInitiativeConfig(),
     llmProvider: document.getElementById('llm-provider').value,
     geminiKey: document.getElementById('gemini-key').value.trim(),
     anthropicKey: document.getElementById('anthropic-key').value.trim(),
     tgBotToken: document.getElementById('tg-bot-token').value.trim(),
     tgChatId: document.getElementById('tg-chat-id').value.trim(),
+    notifyUrl: document.getElementById('tg-worker-url').value.trim(),
+    notifySecret: document.getElementById('tg-notify-secret').value.trim(),
     defaultInitiative: document.getElementById('default-initiative').value,
     autoEnabled: document.getElementById('auto-enabled').checked,
     autoTime: document.getElementById('auto-time').value
@@ -137,11 +140,14 @@ document.getElementById('import-file').addEventListener('change', async (e) => {
       bbToken: imported.bitbucket?.api_token || '',
       bbUsername: imported.bitbucket?.username || '',
       bbWorkspace: imported.bitbucket?.workspace || '',
+      bbProjectKey: imported.bitbucket?.project_key || '',
       llmProvider: imported.llm_provider || 'gemini',
       geminiKey: imported.gemini?.api_key || '',
       anthropicKey: imported.anthropic?.api_key || '',
       tgBotToken: imported.telegram?.bot_token || '',
       tgChatId: imported.telegram?.chat_id || '',
+      notifyUrl: imported.notify?.url || '',
+      notifySecret: imported.notify?.secret || '',
       defaultInitiative: imported.defaultInitiative || '',
       autoEnabled: false,
       autoTime: '09:30',
@@ -188,6 +194,52 @@ document.getElementById('btn-tg-test').addEventListener('click', async () => {
     showToast('Mensagem de teste enviada — confira o Telegram!');
   } catch (err) {
     showToast('Falha no teste: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    spinner.classList.add('hidden');
+  }
+});
+
+// Conectar Telegram por deep link (Fase 1C): gera o link no worker, abre o
+// chat, e faz polling ate o worker devolver o chat_id — sem digitar nada.
+document.getElementById('btn-tg-connect').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-tg-connect');
+  const spinner = document.getElementById('tg-connect-spinner');
+  const workerUrl = document.getElementById('tg-worker-url').value.trim().replace(/\/$/, '');
+  const botToken = document.getElementById('tg-bot-token').value.trim();
+  if (!workerUrl || !botToken) {
+    showToast('Preencha a URL do worker e o Bot Token primeiro.', 'error');
+    return;
+  }
+  btn.disabled = true;
+  spinner.classList.remove('hidden');
+  try {
+    const res = await fetch(`${workerUrl}/devlink`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: botToken })
+    });
+    const data = await res.json().catch(() => ({ ok: false }));
+    if (!data.ok || !data.link) throw new Error(data.error || `HTTP ${res.status}`);
+    window.open(data.link, '_blank');
+    showToast('Abra o Telegram e toque em Iniciar — aguardando conexão...');
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      const s = await fetch(`${workerUrl}/devlink?code=${encodeURIComponent(data.code)}`)
+        .then(r => r.json()).catch(() => ({}));
+      if (s.status === 'linked' && s.chatId) {
+        document.getElementById('tg-chat-id').value = String(s.chatId);
+        const cfg = await loadConfigData();
+        cfg.tgChatId = String(s.chatId);
+        cfg.notifyUrl = workerUrl;
+        await new Promise(r => chrome.storage.local.set({ config: cfg }, r));
+        showToast(`✅ Telegram conectado! chat_id ${s.chatId} salvo.`);
+        return;
+      }
+    }
+    showToast('Não detectei a conexão. Toque em Iniciar no bot e tente de novo.', 'error');
+  } catch (err) {
+    showToast('Erro ao conectar: ' + err.message, 'error');
   } finally {
     btn.disabled = false;
     spinner.classList.add('hidden');
@@ -272,11 +324,14 @@ function loadConfig() {
       document.getElementById('bb-token').value = cfg.bbToken || '';
       document.getElementById('bb-username').value = cfg.bbUsername || '';
       document.getElementById('bb-workspace').value = cfg.bbWorkspace || '';
+      document.getElementById('bb-project-key').value = cfg.bbProjectKey || '';
       document.getElementById('llm-provider').value = cfg.llmProvider || 'gemini';
       document.getElementById('gemini-key').value = cfg.geminiKey || '';
       document.getElementById('anthropic-key').value = cfg.anthropicKey || '';
       document.getElementById('tg-bot-token').value = cfg.tgBotToken || '';
       document.getElementById('tg-chat-id').value = cfg.tgChatId || '';
+      document.getElementById('tg-worker-url').value = cfg.notifyUrl || '';
+      document.getElementById('tg-notify-secret').value = cfg.notifySecret || '';
       document.getElementById('default-initiative').value = String(cfg.defaultInitiative || '6');
       document.getElementById('auto-enabled').checked = !!cfg.autoEnabled;
       document.getElementById('auto-time').value = cfg.autoTime || '09:30';
@@ -374,6 +429,24 @@ document.getElementById('btn-submit').addEventListener('click', async () => {
   }
 });
 
+// --- Skip local (Fase 5a) ------------------------------------------------------
+
+async function refreshLocalSkips() {
+  const el = document.getElementById('local-skips');
+  if (!el) return;
+  const skips = await getLocalSkips();
+  el.textContent = skips.length ? 'Pulos locais agendados: ' + skips.join(', ') : '';
+}
+
+document.getElementById('btn-skip-tomorrow').addEventListener('click', async () => {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const iso = localIsoDate(tomorrow);
+  await addLocalSkip(iso);
+  await refreshLocalSkips();
+  showToast(`Check-in automático de ${iso} será pulado.`);
+});
+
 async function loadInitiatives() {
   const checkinSelect = document.getElementById('checkin-initiative');
   const defaultSelect = document.getElementById('default-initiative');
@@ -445,6 +518,112 @@ document.getElementById('btn-suggest').addEventListener('click', async () => {
   }
 });
 
+// --- Fase 4b: detectar projetos/repos novos e mapear com um toque ------------
+
+function bestInitiativeMatch(key, initiatives) {
+  const k = normalizeStr(key);
+  for (const init of initiatives) {
+    const n = normalizeStr(init.name);
+    if (n && (n.includes(k) || k.includes(n))) return init.id;
+  }
+  return initiatives[0]?.id ?? '';
+}
+
+function appendToInput(inputId, value) {
+  const el = document.getElementById(inputId);
+  if (!el) return false;
+  const parts = el.value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!parts.some(p => p.toLowerCase() === value.toLowerCase())) parts.push(value);
+  el.value = parts.join(', ');
+  return true;
+}
+
+async function persistInitiativeConfig() {
+  const cfg = await loadConfigData();
+  cfg.initiativeConfig = readInitiativeConfig();
+  await new Promise(r => chrome.storage.local.set({ config: cfg }, r));
+}
+
+function renderUnmappedSuggestions(unmapped, initiatives) {
+  const container = document.getElementById('unmapped-container');
+  container.innerHTML = '';
+  const items = [
+    ...unmapped.projects.map(k => ({ type: 'project', key: k })),
+    ...unmapped.repos.map(k => ({ type: 'repo', key: k }))
+  ];
+  if (!items.length) {
+    container.innerHTML = '<p class="text-muted" style="font-size: 12px; opacity: 0.6;">Nenhum projeto/repo novo detectado na atividade recente 🎉</p>';
+    return;
+  }
+  items.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'form-group row';
+    row.style.cssText = 'margin-bottom: 8px; align-items: flex-end; gap: 6px;';
+
+    const label = document.createElement('div');
+    label.style.cssText = 'font-size: 12px; flex: 1;';
+    label.textContent = (item.type === 'project' ? 'Projeto ' : 'Repo ') + item.key;
+
+    const select = document.createElement('select');
+    select.className = 'form-control';
+    select.style.cssText = 'flex: 1; font-size: 12px;';
+    initiatives.forEach(init => {
+      const o = document.createElement('option');
+      o.value = String(init.id);
+      o.textContent = init.name;
+      select.appendChild(o);
+    });
+    select.value = String(bestInitiativeMatch(item.key, initiatives));
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-secondary btn-sm';
+    btn.textContent = 'Vincular';
+    btn.addEventListener('click', async () => {
+      const initId = select.value;
+      const inputId = item.type === 'project' ? `jira-project-${initId}` : `repo-input-${initId}`;
+      if (!appendToInput(inputId, item.key)) {
+        showToast('Salve as configurações uma vez para carregar as iniciativas e tente de novo.', 'error');
+        return;
+      }
+      await persistInitiativeConfig();
+      row.remove();
+      showToast(`${item.key} vinculado — mapeamento salvo.`);
+    });
+
+    row.appendChild(label);
+    row.appendChild(select);
+    row.appendChild(btn);
+    container.appendChild(row);
+  });
+}
+
+document.getElementById('btn-detect-unmapped').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-detect-unmapped');
+  const spinner = document.getElementById('detect-spinner');
+  spinner.classList.remove('hidden');
+  btn.disabled = true;
+  try {
+    const cfg = await loadConfigData();
+    if (!cfg.jiraUrl || !cfg.jiraEmail || !cfg.jiraToken) {
+      showToast('Configure o Jira primeiro.', 'error');
+      return;
+    }
+    const sinceStr = localIsoDate(getLastBusinessDay());
+    const jiraAct = await fetchJira(cfg, sinceStr).catch(() => []);
+    const bbAct = await fetchBitbucket(cfg, sinceStr).catch(() => []);
+    const defaultInitiative = Number(cfg.defaultInitiative) || 6;
+    const { unmapped } = routeActivity(jiraAct, bbAct, cfg.initiativeConfig || {}, defaultInitiative);
+    const initiatives = await fetchInitiatives();
+    renderUnmappedSuggestions(unmapped, initiatives);
+  } catch (err) {
+    showToast('Erro ao detectar: ' + err.message, 'error');
+  } finally {
+    spinner.classList.add('hidden');
+    btn.disabled = false;
+  }
+});
+
 // Init
 document.addEventListener('DOMContentLoaded', async () => {
   await loadInitiatives();
@@ -452,4 +631,5 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadConfig();
   loadDraftForInitiative(currentInitiative);
   checkSession();
+  refreshLocalSkips();
 });

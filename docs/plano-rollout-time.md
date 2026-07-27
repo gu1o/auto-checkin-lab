@@ -64,56 +64,75 @@ Fluxo da skill:
 suportando roteamento multi-iniciativa via `initiative_config` do export) +
 seção no README/guia.
 
-## Fase 3 — `project_key` no Bitbucket + paginação
+## Fase 3 — `project_key` no Bitbucket + paginação ✅ *(implementada em 2026-07-17)*
 
-**Onde:** `auto_activity.py`, `extension/lib.js`, `config.json.example`,
-form `/setup` do worker.
+**Onde:** `auto_activity.py`, `extension/lib.js` (+ `popup.js`/`popup.html`),
+`config.json.example`, form `/setup` do worker.
 
 - Novo campo `bitbucket.project_key`: filtra repos por project do Bitbucket
   (`/2.0/repositories/{ws}?q=project.key="X"`) — um campo em vez de enumerar
-  N repos (caso idealplus).
-- Corrigir a auto-descoberta: paginar além do `pagelen=100` (hoje trunca
-  workspaces com >100 repos silenciosamente).
+  N repos (caso idealplus). Presente no config, no export/import da extensão
+  (campo "Project key") e no form `/setup`.
+- Auto-descoberta agora **pagina** seguindo o campo `next` da resposta (teto de
+  50 páginas) — antes `pagelen=100` truncava workspaces com >100 repos em
+  silêncio. Helper único `listWorkspaceRepos` na extensão (reusado pela
+  sugestão de iniciativas).
 - Precedência: `repositories` explícito > `project_key` > todos (paginado).
 
-## Fase 4 — Roteamento multi-iniciativa
+## Fase 4 — Roteamento multi-iniciativa ✅ *(implementada em 2026-07-17, runner script/extensão)*
 
-**Onde:** `auto_activity.py`/`checkin.sh`, espelho na extensão e no template
-da rotina.
+**Onde:** `auto_activity.py` (`route_activity`) + `checkin.sh` (`cmd_auto`
+itera um submit por iniciativa) e espelho na extensão (`lib.js` `routeActivity`
++ `runAutoCheckin`). Rotina cloud já roteava por lógica de prompt.
 
-- Mapa no config (configuração única por projeto, não por sprint):
+- **Schema (reconciliado com o que já existia na extensão):** em vez do array
+  `initiatives` proposto, usa-se o `initiative_config` que a extensão já grava
+  e exporta — mapas por id de iniciativa:
 
   ```json
-  "initiatives": [
-    { "id": 6,  "jira_projects": ["AUD"], "bb_project_key": "IDEALPLUS" },
-    { "id": 17, "jira_projects": ["SI"],  "repos": ["solucoesindustriais.com.br"] }
-  ]
+  "initiative_config": {
+    "repos":    { "6": "idealplus-api, outra-repo", "17": "solucoesindustriais.com.br" },
+    "projects": { "6": "AUD", "17": "SI" }
+  }
   ```
 
-- Roteamento: extrai o project key do Jira da issue e do branch/mensagem de
-  commit (padrão `KEY-123`); fallback pelo repo. Gera resumo e faz **um submit
-  por iniciativa com atividade**; um ✅ no canal por form enviado.
+- Roteamento: issue do Jira pela project key (prefixo de `KEY-123`); commit
+  pelo repo, com **fallback** para a project key achada na mensagem do commit
+  (`\bKEY-\d+\b`). Faz **um submit por iniciativa com atividade**; um ✅ no
+  canal por form enviado. (Python e extensão validados com paridade de saída.)
 - Iniciativa sem atividade no dia: **pula** (fica pendente no Lab).
-- Atividade não mapeada: iniciativa default + aviso no canal.
+- Atividade não mapeada: iniciativa default (`--initiative`, padrão 6) + aviso
+  ⚠️ no canal.
 - Mapa vazio = comportamento atual (uma iniciativa padrão) — quem tem um
   projeto só não configura nada.
-- **4b (UX):** ao detectar project key desconhecido, o bot cruza por nome com
-  as iniciativas vinculadas do dev (cards da página diária) e propõe o
-  mapeamento por botão inline no Telegram — entrar em projeto novo vira
-  confirmar um toque.
+- **Refinamento (evita regressão):** dia sem *nenhuma* atividade mapeada ainda
+  garante o submit da iniciativa padrão (template "sem atividades"), para quem
+  ativa o multi-iniciativa não deixar de bater ponto em dia quieto.
+- **4b (UX) ✅ *(implementada em 2026-07-17, na extensão)*:** o roteamento
+  agora expõe os project keys / repos **não mapeados** (em `route_activity` e no
+  `routeActivity`, e nomeados no aviso ⚠️ dos dois runners). Na extensão, o
+  botão **"🔍 Detectar projetos novos"** cruza cada chave desconhecida por nome
+  com as iniciativas do dev (cards da página diária) e propõe o vínculo — um
+  toque em **Vincular** grava no `initiative_config` e salva. *Nota de escopo:*
+  o "toque" vive na UI da extensão (self-contained), não no botão inline do
+  Telegram — a versão via bot depende do worker ser o runner (Fase 6, fora
+  deste rollout).
 
-## Fase 5 — Canais de notificação alternativos
+## Fase 5 — Canais de notificação alternativos ✅ *(implementada em 2026-07-17)*
 
-- **5a (zero infra):** `chrome.notifications` na extensão + botão "Pular
-  amanhã" local (storage); subcomando `checkin.sh pular DD/MM` (arquivo
-  local) para o CLI; rotina cloud envia e-mail pelo conector Gmail do próprio
-  dev.
-- **5b (se houver demanda real de e-mail no cron local):** endpoint
-  `POST /notify` autenticado no worker — runner manda o texto, worker resolve
-  o canal do dev (Telegram ou e-mail via API tipo Resend/SendGrid, conta
-  dedicada apenas como remetente). **Um segredo, num lugar só**; bônus: tira o
-  `bot_token` de circulação dos configs dos devs.
-  - Decisão registrada: **não** distribuir credencial SMTP nos runners; o mix
+- **5a (zero infra) ✅:** `chrome.notifications` na extensão (com botão "Pular
+  amanhã" na própria notificação) + botão "Pular amanhã" no popup (storage);
+  subcomandos `checkin.sh pular/retomar/pulos DD/MM` (arquivo local
+  `.skips.json`, respeitado pelo `cmd_auto`) para o CLI; rotina cloud envia
+  e-mail pelo conector Gmail do próprio dev (passo documentado na skill).
+- **5b ✅:** endpoint `POST /notify` autenticado (`x-notify-secret` ==
+  `NOTIFY_SECRET`) no worker — runner manda `{chatId, text}`, worker entrega por
+  Telegram (e por e-mail via Resend se o dev tiver `prefs.email` e o worker
+  tiver `RESEND_API_KEY`). **Um segredo, num lugar só**; tira o `bot_token` dos
+  configs — `checkin.sh notify()` e o `telegramNotify` da extensão usam o
+  `/notify` quando `notify.url`+`notify.secret` estão setados, com fallback
+  para envio direto.
+  - Decisão mantida: **não** distribuir credencial SMTP nos runners; o mix
     Gmail/Outlook dos destinatários é irrelevante para o envio.
 
 ---
@@ -123,12 +142,12 @@ da rotina.
 ```
 F1 descartada (cookie no export ✅ substitui)
 F2 skill ✅ ──> piloto com devs
-F3 (project_key) ──> F4 no script/extensão (multi-iniciativa) ──> F4b (mapeamento via bot)
-F5a (independente)   F5b (após adoção, se necessário)
+F3 (project_key + paginação) ✅ ──> F4 no script/extensão (multi-iniciativa) ✅ ──> F4b (mapeamento assistido na extensão) ✅
+F5a ✅ (independente)   F5b ✅
 ```
 
 - A rotina criada pela skill **já roteia multi-iniciativa** (é lógica de
-  prompt); F4 permanece para os runners script/extensão.
+  prompt); F4 nos runners script/extensão ✅ concluída.
 - F3 antes de F4 (o roteamento reusa o filtro por project).
 - **Rollout:** piloto com 1–2 devs (incluindo o que já testou o Telegram) →
   ajustes → anúncio para o time com a skill como porta de entrada.

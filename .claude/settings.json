@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f \"${CLAUDE_PROJECT_DIR:-.}/config.json\" ] || printf %s '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Repo lab-checkin sem config.json: este dev ainda nao configurou o check-in automatico. Antes de responder qualquer outra coisa, pergunte a ele (use AskUserQuestion) onde quer rodar o check-in: (A) rotina agendada na nuvem, na conta claude.ai dele - roda sem depender da maquina ligada; (B) cron local na maquina dele - so roda com a maquina ligada no horario; (C) agora nao. Em A ou B, invoque a skill setup-checkin passando a escolha. Em C, siga normalmente com o pedido dele e nao pergunte de novo nesta sessao.\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}

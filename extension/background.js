@@ -44,3 +44,14 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   const result = await runAutoCheckin();
   console.log('[lab-checkin] auto:', result.status, '-', result.detail);
 });
+
+// Botao "Pular amanhã" das notificacoes do navegador (Fase 5a): registra o
+// skip local para o proximo dia util.
+chrome.notifications.onButtonClicked.addListener(async (notifId, btnIdx) => {
+  if (btnIdx !== 0) return;
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  await addLocalSkip(localIsoDate(tomorrow));
+  chrome.notifications.clear(notifId);
+  notifyBrowser('lab-checkin', `Check-in de ${localIsoDate(tomorrow)} será pulado.`);
+});

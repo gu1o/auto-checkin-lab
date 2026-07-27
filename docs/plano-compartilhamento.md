@@ -1,12 +1,13 @@
 # Plano: compartilhar a automação de check-in com o time
 
-> **Status: implementado (2026-07-16) — Fases 1, 1B, 2, 3, 4 e 5.**
+> **Status: implementado — Fases 1, 1B, 1C, 2, 3, 4, 5 e 6.**
 > Worker multi-usuário com `/start` + aprovação + KV em deploy; `/config` +
-> formulário one-time-link com AES-GCM; `/pular` no `checkin.sh`; extensão
-> como hub (Telegram, iniciativa padrão, exportar config.json), motor
-> plugável Gemini/Claude e modo automático via `chrome.alarms`.
-> Pendentes (conforme demanda): Fase 1C (deep linking) e Fase 6 (runner
-> centralizado no worker).
+> formulário one-time-link com AES-GCM; deep linking extensão↔bot (`/devlink`);
+> `/pular` no `checkin.sh`; extensão como hub (Telegram, iniciativa padrão,
+> exportar config.json), motor plugável Gemini/Claude e modo automático via
+> `chrome.alarms`.
+> Fase 6 (runner centralizado no worker) implementada em 2026-07-24 como
+> **opt-in por usuário** (`/runner on`, default OFF).
 > Contexto: hoje a automação completa (CLI + rotinas cloud + bot do Telegram
 > com `/pular` via Cloudflare Worker) atende **um** dev. O objetivo é abrir
 > para ~5 devs, cada um configurando as próprias credenciais (Jira, Bitbucket,
@@ -100,14 +101,16 @@ continuam existindo para quem preferir manter credenciais só na própria
 máquina — **o Telegram é opcional**, e sem segredos no KV o bot segue útil
 para `/pular` + notificações.
 
-## Fase 1C (futuro) — Deep linking com a extensão
+## Fase 1C ✅ *(implementada em 2026-07-17)* — Deep linking com a extensão
 
 O Telegram suporta `https://t.me/CheckInLabBot?start=CODIGO` (o `/start`
-chega com o payload). A extensão (Fase 3) pode mostrar um botão "Conectar
-Telegram" que gera um código curto; o usuário clica, cai no chat, e o worker
-vincula o chat_id àquela config automaticamente — sem digitar nada e sem
-aprovação manual (o código prova que a pessoa veio da extensão). Evolução
-natural depois do auto-registro básico funcionar.
+chega com o payload). A extensão mostra o botão **"🔗 Conectar Telegram"**:
+ela chama `POST /devlink` no worker (autenticado com o **bot token**
+compartilhado — prova que veio da extensão), recebe o link `t.me/...start=<codigo>`,
+abre o chat e faz *polling* em `GET /devlink?code=` até o worker devolver o
+`chat_id`. O `/start <codigo>` **auto-aprova o chat sem o botão do admin** e
+grava `devlink:<codigo>` como `linked` com o `chat_id`; a extensão salva esse
+`chat_id` sozinha — sem digitar nada. Código de uso único, TTL de 10 min.
 
 ## Fase 2 — `/pular` no CLI local (`checkin.sh`)
 
@@ -175,15 +178,46 @@ total **sem cookie manual e sem cron**, usando a sessão viva do navegador
    login (não há o que renovar automaticamente).
 4. Toggle "Modo automático" + horário na aba Configurações.
 
-## Fase 6 (opcional, decidir depois) — Check-in centralizado no worker
+## Fase 6 ✅ *(implementada em 2026-07-24)* — Check-in centralizado no worker
 
 Guardar segredos no KV (Fase 1B) só se paga por completo se algo os consumir.
 A consequência natural: um **Cron Trigger** no próprio worker rodando o
-check-in diário de todos os usuários `active` — coleta Jira/Bitbucket via
-`fetch`, gera o texto (API do LLM), respeita a mensagem fixada de cada chat e
-envia ao Lab com a credencial de cada um. Eliminaria a rotina cloud por dev e
-o cron local. É uma expansão de escopo relevante (o worker vira o runner de
-todo mundo) — fica registrado como possibilidade, não como compromisso.
+check-in de cada dev — coleta Jira/Bitbucket via `fetch`, gera o texto
+(Claude/Gemini/template), respeita a mensagem fixada de cada chat e envia ao
+Lab com a credencial de cada um. Fecha o laço `/repos`/`/painel` → coleta real:
+o que o dev ajusta no KV passa a valer de fato.
+
+**Como ficou (worker `worker/worker.js` + `wrangler.toml [triggers]`):**
+
+- **Opt-in por usuário, default OFF.** `prefs.runner === 'worker'` (KV) liga o
+  runner para aquele dev; sem isso o cron o ignora. Comando `/runner on|off`;
+  estado visível no `/painel`. Deploy é **inerte** até alguém optar — não
+  toca em quem usa rotina cloud/CLI.
+- **Cron tick idempotente.** `crons = ["*/15 11-21 * * 1-5"]` (UTC ≈ 08–18
+  America/Sao_Paulo, seg–sex). `scheduled` → `runnerCron`: itera `USERS`
+  (`env.USERS.list`), e para cada `active` com o runner ligado aplica o gate de
+  horário (`prefs.time`) + as guardas de fim de semana/feriado/`/pular`/
+  já-preenchido. Rodar 40×/dia não reenvia (a guarda "já preenchida" via
+  `getChat`/props do Lab é idempotente).
+- **Porta do `checkin.sh` + `auto_activity.py` para JS:** feriados
+  (estáticos + Páscoa + BrasilAPI), último dia útil, coleta Jira
+  (`/rest/api/3/search/jql`) e Bitbucket (paginado, filtro por autor/padrões),
+  roteamento multi-iniciativa (`initiative_config`), geração (Claude
+  `claude-opus-4-8` via HTTP / Gemini / template) e submit ao Lab replicando o
+  fluxo do cookie `remember_web` (GET renova sessão + `XSRF-TOKEN` via
+  `getSetCookie()`; POST Inertia com os headers do script).
+- **Teste antes de confiar no cron:** `/dryrun` mostra o rascunho sem enviar;
+  `/agora` roda e envia na hora (respeitando fim de semana/feriado/`/pular`).
+- **Notificação de baixo ruído:** o cron só avisa em envio (✅) ou erro (❌);
+  cala em já-preenchido / fim de semana / feriado / pulado.
+
+> ⚠️ **Coexistência.** Enquanto o dev roda rotina cloud OU cron local, **não**
+> ligue o `/runner` — os dois enviariam (a guarda "já preenchida" evita duplo
+> POST, mas é corrida e ruído). Migração: desligar a rotina cloud/local, testar
+> com `/dryrun`+`/agora`, então `/runner on`. Limitação herdada: o cookie
+> `remember_web` no KV expira; quando expirar, o runner responde ❌ pedindo
+> relogin + `/config` (mesma dor que os outros trilhos — ver a nota sobre token
+> de API pessoal no Lab).
 
 ## Melhoria estrutural (independente das fases): token de API pessoal no Lab
 
@@ -267,4 +301,4 @@ mensagem fixada como estado, e a mesma config (via extensão + export, ou via
 4. Fase 3 (extensão como hub + export) — onboarding do trilho local.
 5. Fase 4 (motor plugável Gemini/Claude).
 6. Fase 5 (modo automático da extensão).
-7. Fase 1C (deep linking) e Fase 6 (runner centralizado) — conforme demanda.
+7. Fase 1C (deep linking) ✅. Fase 6 (runner centralizado) — conforme demanda.

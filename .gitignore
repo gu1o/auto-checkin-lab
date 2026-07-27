@@ -1,4 +1,5 @@
 config.json
 cookies.txt
 .poller_state.json
+.skips.json
 __pycache__/

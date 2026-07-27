@@ -6,7 +6,8 @@
   "permissions": [
     "cookies",
     "storage",
-    "alarms"
+    "alarms",
+    "notifications"
   ],
   "host_permissions": [
     "https://lab.idealtrends.io/*",
@@ -14,7 +15,8 @@
     "https://api.bitbucket.org/*",
     "https://generativelanguage.googleapis.com/*",
     "https://api.anthropic.com/*",
-    "https://api.telegram.org/*"
+    "https://api.telegram.org/*",
+    "https://*.workers.dev/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -1,6 +1,6 @@
 ---
 name: setup-checkin
-description: Configura o check-in automático diário da Saúde da Entrega (Ideal Lab) para o dev atual — importa o config.json exportado pela extensão, valida todas as credenciais e cria a rotina agendada na conta do próprio dev. Use quando o dev quiser ativar, reconfigurar ou renovar credenciais do check-in automático.
+description: Configura o check-in automático diário da Saúde da Entrega (Ideal Lab) para o dev atual — pergunta onde vai rodar (rotina agendada na nuvem ou cron local), pega as credenciais dos conectores MCP (Atlassian/Ideal Lab) ou do config.json da extensão, valida tudo e cria o agendamento. Use quando o dev quiser ativar, reconfigurar ou renovar credenciais do check-in automático.
 ---
 
 # Setup do check-in automático (Ideal Lab)
@@ -18,7 +18,42 @@ Regras gerais:
   "check-in" ou "lab-checkin"), **atualize-a** em vez de criar duplicata —
   este é também o fluxo de renovação de cookie.
 
-## 1. Obter o config.json
+## 0. Duas escolhas iniciais
+
+Pergunte as duas com `AskUserQuestion` (se a sessão começou com o aviso de
+"repo sem config.json", a primeira já pode ter sido respondida).
+
+**0.1 Onde roda** (define a etapa 6):
+
+- **Nuvem** — rotina agendada na conta claude.ai do dev. Roda com a máquina
+  desligada; é o setup do Guilherme. Default.
+- **Local** — `cron` na máquina do dev chamando `checkin.sh auto`. Só roda com
+  a máquina ligada; precisa de key de IA (Gemini free serve) para gerar o texto.
+
+**0.2 Origem das credenciais** (default: **MCP** se ele já usa conectores):
+
+- **MCP** — Jira e Lab (leitura) vêm dos conectores da conta dele; só o token
+  do Bitbucket e o cookie do Lab são digitados. Sem extensão. **Só vale no modo
+  nuvem** — o `checkin.sh` local não fala MCP, então local ⇒ config.json.
+- **config.json da extensão** — tudo vem do export (etapa 1).
+
+Modo MCP: peça para o dev conectar em `claude.ai` → Configurações → Conectores:
+**Atlassian** (Jira) e **Ideal Lab**. Confirme chamando `atlassianUserInfo` e
+`list-initiatives`; se a tool não existir na sessão, o conector não está
+conectado — pare e aguarde. Depois peça no chat:
+
+| Dado | Como obter |
+|---|---|
+| Token do Bitbucket (`Repositories: Read`) | id.atlassian.com → Security → API tokens |
+| Cookie `remember_web` do Lab | Extensão → "Exportar config.json", ou DevTools → Application → Cookies em `lab.idealtrends.io` |
+
+Grave-os em `config.json` (mesmo formato do `config.json.example`, campos de
+Jira vazios) para o `/testar` e o CLI reaproveitarem, e pule para a etapa 4.
+
+> O cookie é obrigatório mesmo no modo A: o MCP do Lab lê iniciativas e saúde,
+> mas não envia check-in diário — o envio é o POST em `/saude-entrega/daily`.
+
+## 1. Obter o config.json (modo B)
 
 Procure `config.json` na raiz deste repositório. Se não existir, oriente o dev:
 
@@ -57,12 +92,21 @@ Se o dev quiser notificações e o telegram estiver vazio:
 
 O bot também dá `/pular DD/MM` (cancela um dia), `/testar` (valida as
 credenciais salvas no `/config`) e `/config` (formulário seguro de
-credenciais na nuvem).
+credenciais na nuvem). Atalho: na extensão, o botão **🔗 Conectar Telegram**
+faz o registro por deep link e já preenche o `chat_id` sozinho (sem digitar).
+
+**Notificação por e-mail (alternativa ao Telegram):** na rotina cloud, o dev
+pode dispensar o Telegram e pedir para a rotina te avisar por **e-mail via o
+conector Gmail** dele — acrescente ao final do prompt da rotina um passo
+"envie um e-mail para {EMAIL} com o resumo do check-in" (o Claude Code usa o
+conector Gmail do próprio dev). Não distribua credencial SMTP.
 
 ## 4. Validar credenciais e descobrir iniciativas
 
 Execute os checks abaixo (via curl/fetch) e mostre um relatório ✅/❌. Todos
-são somente-leitura.
+são somente-leitura. **No modo MCP**, troque o check do Jira por
+`atlassianUserInfo` e o das iniciativas por `list-initiatives` do MCP do Lab
+(o check do cookie continua valendo — é ele que envia).
 
 - **Jira**: `GET {jira.url}/rest/api/3/myself` com `Authorization: Basic
   base64(email:api_token)` → 200; guarde o displayName.
@@ -90,7 +134,26 @@ Pergunte ao dev (com defaults):
   iniciativa — confirme com o dev) e defina uma default para atividade não
   mapeada.
 
-## 6. Criar a rotina
+## 6. Criar o agendamento
+
+### 6-local — cron na máquina do dev
+
+Só se ele escolheu **Local** em 0.1. Confira que o `config.json` tem a key de
+IA (`gemini`/`claude`) — sem ela o `auto` não gera texto — e valide com
+`./checkin.sh auto --dry-run` (não envia nada; mostre a saída ao dev). Depois
+acrescente a entrada de cron, sem apagar as existentes e sem duplicar
+(`crontab -l` primeiro; se já houver linha com `checkin.sh`, substitua-a):
+
+```
+{MIN} {HORA} * * 1-5 cd {REPO} && ./checkin.sh auto >> /tmp/lab-checkin.log 2>&1
+```
+
+Alternativa se a máquina costuma estar desligada no horário: `schedule.enabled`
+/ `schedule.time` no config + cron de tick a cada 15 min (`*/15 * * * *`) — o
+gate interno só envia no/depois do horário e uma vez por dia. Pule para a
+etapa 7 (só o item 3 se aplica).
+
+### 6-nuvem — rotina agendada no claude.ai
 
 Monte o prompt da rotina a partir do template abaixo, preenchendo os
 placeholders com os dados do config (as credenciais entram no corpo da rotina,
@@ -105,6 +168,9 @@ Credenciais: Jira {URL} (email {EMAIL}, token {JIRA_TOKEN}); Bitbucket
 workspace {WORKSPACE} (token {BB_TOKEN}); cookie do Lab
 {COOKIE_NAME}={COOKIE_VALUE}; Telegram bot {BOT_TOKEN}, chat {CHAT_ID}.
 [omitir a linha do Telegram se não configurado]
+[modo MCP: troque a parte do Jira por "Use o conector Atlassian (MCP) para o
+Jira — searchJiraIssuesUsingJql com assignee = currentUser()" e mantenha
+Bitbucket/cookie/Telegram como acima]
 
 Guardas — pare silenciosamente se qualquer uma valer:
 1. Hoje é fim de semana ou feriado nacional/SP (calcule os móveis: Carnaval,
@@ -143,11 +209,14 @@ expirado, diga: "logue no Lab, exporte o config.json na extensão e rode
 /setup-checkin de novo").
 ```
 
-## 7. Pós-setup (passos manuais do dev)
+## 7. Pós-setup (passos manuais do dev — itens 1 e 2 só no modo nuvem)
 
 1. **Allowlist de egress** do environment da rotina (só pela UI do claude.ai:
    ícone do environment → engrenagem): liberar `lab.idealtrends.io`,
-   `api.telegram.org`, `*.atlassian.net` e `api.bitbucket.org`.
+   `api.telegram.org`, `*.atlassian.net` e `api.bitbucket.org`. No modo A,
+   no modo MCP, `*.atlassian.net` só é necessário se algo ainda chamar a API do
+   Jira direto — e confira na UI da rotina que os conectores Atlassian e Ideal
+   Lab estão habilitados para ela (conector desabilitado = rotina sem o Jira).
 2. **Teste real**: dispare uma execução manual da rotina (UI de routines) num
    dia em que o check-in ainda não foi preenchido; confira o form no Lab e a
    notificação. Alternativa sem esperar: rode agora os checks da etapa 4 de

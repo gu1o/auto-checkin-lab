@@ -10,6 +10,14 @@ compatibility_date = "2026-07-01"
 [vars]
 ADMIN_CHAT_ID = "140674932"
 
+# Cron Trigger (Fase 6): tick a cada 15 min em horario comercial (UTC 11-21 =
+# 08-18 America/Sao_Paulo), seg-sex. O handler `scheduled` so age em usuarios
+# active com prefs.runner==='worker'; inerte enquanto ninguem optou pelo /runner.
+# O gate schedule (prefs.time) torna o tick idempotente junto com a guarda de
+# "ja preenchido". Ver worker.js -> runnerCron.
+[triggers]
+crons = ["*/15 11-21 * * 1-5"]
+
 # KV com os registros de usuarios (user:<chat_id>), codigos one-time de setup
 # (setup:<codigo>, TTL 10 min) e credenciais criptografadas (secrets:<chat_id>).
 # Criar com: npx wrangler kv namespace create USERS
