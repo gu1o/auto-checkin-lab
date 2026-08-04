@@ -362,12 +362,12 @@ Com base nas seguintes informações de atividades brutas coletadas do Jira e Bi
 
 Regras importantes:
 1. Escreva em português, de forma profissional, direta e natural, no estilo de atualização diária (daily).
-2. Não cite os códigos das tasks do Jira (ex: evite escrever "PROJ-123" ou "Ideal-456"). Fale apenas do assunto de forma natural.
-3. Sintetize as informações. Não liste apenas commits de forma literal, agrupe-os em realizações lógicas.
-4. Para a parte "today", deduza o que deve ser feito com base nas tarefas que ainda não estão concluídas (ex: status "In Progress" ou pendentes), ou indique continuação/refinamento das tarefas recentes.
-`;
+2. Escreva na primeira pessoa do singular ("eu", "concluí", "farei", "entreguei"), como um dev falando das próprias atividades. Nunca use a primeira pessoa do plural ("nós", "faremos", "concluímos") nem a terceira pessoa.
+3. Não cite os códigos das tasks do Jira (ex: evite escrever "PROJ-123" ou "Ideal-456"). Fale apenas do assunto de forma natural.
+4. Sintetize as informações. Não liste apenas commits de forma literal, agrupe-os em realizações lógicas.
+5. Para a parte "today", deduza o que deve ser feito com base nas tarefas que ainda não estão concluídas (ex: status "In Progress" ou pendentes), ou indique continuação/refinamento das tarefas recentes.`;
   if (withJsonInstruction) {
-    prompt += `5. Retorne a resposta estritamente no formato JSON abaixo, sem blocos de código markdown adicionais:
+    prompt += `6. Retorne a resposta estritamente no formato JSON abaixo, sem blocos de código markdown adicionais:
 {
   "yesterday": "texto sintetizado do que foi feito ontem",
   "today": "texto sintetizado do que será feito hoje"

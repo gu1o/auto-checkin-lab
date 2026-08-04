@@ -1282,10 +1282,11 @@ function genPrompt(ctx) {
     'Com base nas atividades brutas do Jira e Bitbucket abaixo, gere dois blocos de texto em português (um "yesterday", um "today").\n\n' +
     'Regras:\n' +
     '1. Português profissional, direto e natural, estilo daily.\n' +
-    '2. Não cite códigos de tasks (ex: evite "PROJ-123"). Fale do assunto de forma natural.\n' +
-    '3. Sintetize; agrupe commits em realizações lógicas em vez de listar literalmente.\n' +
-    '4. Para "today", deduza o que fazer com base nas tarefas não concluídas (In Progress/pendentes) ou continuação.\n' +
-    '5. Responda estritamente no JSON: {"yesterday": "...", "today": "..."}\n\n' +
+    '2. Escreva na primeira pessoa do singular ("eu", "concluí", "farei", "entreguei"), como um dev falando das próprias atividades. Nunca use a primeira pessoa do plural ("nós", "faremos", "concluímos") nem a terceira pessoa.\n' +
+    '3. Não cite códigos de tasks (ex: evite "PROJ-123"). Fale do assunto de forma natural.\n' +
+    '4. Sintetize; agrupe commits em realizações lógicas em vez de listar literalmente.\n' +
+    '5. Para "today", deduza o que fazer com base nas tarefas não concluídas (In Progress/pendentes) ou continuação.\n' +
+    '6. Responda estritamente no JSON: {"yesterday": "...", "today": "..."}\n\n' +
     'Dados de atividade:\n' +
     JSON.stringify(ctx, null, 2)
   );
