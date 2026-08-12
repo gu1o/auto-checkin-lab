@@ -14,6 +14,29 @@ credenciais são as mesmas, só muda onde o fluxo roda):
 > Os modos não conflitam: todos respeitam as mesmas guardas (fim de semana,
 > feriado, `/pular`, já preenchido), então rodar mais de um não duplica nada.
 
+### Não quer decidir lendo tabela? Deixe o Claude perguntar
+
+Clone o repo e **abra o Claude Code na pasta** — enquanto não existir um
+`config.json` ali, ele começa a sessão perguntando qual dos modos você quer
+(A / B / C, ou "agora não") e conduz o setup a partir da sua resposta:
+
+```bash
+git clone <repo> && cd lab-checkin
+claude
+```
+
+- Escolheu **B (rotina)** ou **C (cron)** → ele chama a skill `/setup-checkin`
+  sozinho: pede as credenciais que faltam, valida uma a uma contra Jira,
+  Bitbucket e Lab, lista as suas iniciativas, pergunta horário e estilo de
+  escrita e cria o agendamento. É o caminho mais curto para o modo B.
+- Escolheu **A (extensão)** → ele te guia pela instalação abaixo; depois, o
+  "Exportar config.json" migra você para B ou C sem redigitar nada.
+- Escolheu **agora não** → ele não pergunta de novo (grava
+  `.claude/.setup-declined`). Rode `/setup-checkin` quando quiser.
+
+Já tem `config.json` na pasta (veio da extensão) e quer a rotina? A pergunta
+não aparece — rode `/setup-checkin` direto; a skill importa o arquivo.
+
 ---
 
 ## Passo 0 — Comum a todos os modos
@@ -29,6 +52,14 @@ credenciais, `/config` para credenciais na nuvem).
 3. Guarde seu `chat_id` (o bot informa) — você vai usá-lo na configuração.
 4. Token do bot: peça ao admin (é compartilhado no time; cada dev tem o
    próprio chat, então ninguém vê notificação de ninguém).
+
+O `/config` do bot também guarda o seu **estilo de escrita** (o mesmo material
+do B.3): cole ali 2–3 check-ins seus e a IA passa a imitá-los. E com
+`/aprovar on` o bot para de enviar direto — manda o rascunho no chat com
+**✅ Enviar** / **✏️ Refazer**; se você recusar, ele pergunta o contexto a usar
+de base e regera na hora. Isso vale para quem roda pelo **runner do worker**
+(`/runner on`) — a rotina do modo B envia sozinha e não tem como esperar o seu
+clique.
 
 Sem Telegram? Tudo funciona igual, só sem notificação/comando remoto — deixe
 os campos de Telegram em branco. (Canais alternativos — e-mail, notificação
@@ -71,7 +102,14 @@ do navegador — estão no roadmap: `docs/plano-rollout-time.md`.)
 ## Modo B — Rotina agendada no Claude Code (conta corporativa)
 
 A rotina roda na nuvem do claude.ai, **no seu assento** — não consome a conta
-de ninguém e não precisa de máquina ligada.
+de ninguém e não precisa de máquina ligada nem de navegador aberto. Todo dia,
+no horário marcado, um agente sobe do zero (sem memória do dia anterior),
+segue o roteiro que você escreveu, e morre. É por isso que **tudo o que ele
+precisa saber tem que estar no texto do prompt** — inclusive o seu jeito de
+escrever.
+
+O que ele faz, em ordem: checa as guardas → coleta Jira + Bitbucket → gera o
+texto → faz o POST no Lab → te notifica no Telegram.
 
 > ✅ **Este modo tem setup guiado**: abra o Claude Code na pasta do repo e
 > rode **`/setup-checkin`** — a skill importa o config.json exportado pela
@@ -80,54 +118,128 @@ de ninguém e não precisa de máquina ligada.
 > orienta nos passos manuais. Os passos abaixo documentam o que ela faz, caso
 > prefira o caminho manual:
 
-1. **Credenciais em mãos**: preencha tudo na extensão e use **Exportar
-   config.json** (Modo A, passo 6) — o cookie do Lab já vem incluído. Senão,
-   copie `config.json.example` e preencha (aí sim o cookie sai do DevTools,
-   Passo 0.2).
-2. **Criar a rotina**: no Claude Code, rode `/schedule` e crie uma rotina
-   diária (ex.: 09:30, seg–sex) com um prompt que siga este roteiro:
+### B.1 — Antes de começar (checklist)
 
-   ```text
-   Você preenche meu check-in diário de Saúde da Entrega no Ideal Lab.
+| Item | Como conseguir | Obrigatório? |
+|---|---|---|
+| `config.json` exportado pela extensão | Modo A, passo 6 (já vem com o cookie do Lab) | Sim — ou `config.json.example` preenchido na mão |
+| ID da sua iniciativa | Abra `/saude-entrega/daily`; o card da sua iniciativa tem o id (ou pergunte ao admin) | Sim |
+| Assento corporativo do claude.ai | Já tem, se você usa o Claude Code do time | Sim |
+| Conectores Atlassian / Ideal Lab | Ligados na sua conta claude.ai | Só se você **não** quiser usar token do Jira |
+| Telegram (`bot_token` + `chat_id`) | Passo 0.1 | Não (sem ele, falha silenciosa) |
+| 2–3 check-ins seus antigos, copiados | Do próprio Lab, ou do que você mandaria hoje na daily | Não, mas é o que faz o texto sair com a sua cara — ver B.3 |
 
-   Guardas (pare silenciosamente se qualquer uma valer):
-   1. Fim de semana ou feriado nacional/SP (calcule os móveis: Carnaval,
-      Sexta Santa, Corpus Christi).
-   2. O dia de hoje consta na mensagem fixada do meu chat com o
-      @CheckInLabBot (leia via getChat da API do Telegram; formato
-      "SKIP: YYYY-MM-DD, ..."). Nesse caso, notifique 🚫 e pare.
-   3. O check-in de hoje já está preenchido (GET na página
-      /saude-entrega/daily autenticado com meu cookie remember_web; os
-      cards vêm no atributo data-page).
+### B.2 — Criar a rotina
 
-   Coleta: minhas issues do Jira atualizadas desde o último dia útil
-   (assignee = eu) e meus commits no Bitbucket desde então (repos do
-   config; vazio = todos do workspace, filtrando por autor).
+No Claude Code, rode `/schedule` e crie uma rotina diária (ex.: 09:30,
+seg–sex) com o prompt de B.4. Três coisas que costumam ser esquecidas:
 
-   Gerar: resuma em 1ª pessoa "Ontem" (o que fiz) e "Hoje" (o que farei),
-   objetivo, sem inventar nada. Último dia útil foi feriado/fds → "Ontem"
-   em branco.
+- **Credenciais fora do prompt**: cole o `config.json`/cookie nos secrets ou
+  no ambiente da rotina. Nunca no texto do prompt se ela for compartilhada.
+- **`allowed_tools` precisa incluir `ToolSearch`** além dos `mcp__<conector>`
+  — sem ela o agente não carrega o schema de nenhuma tool de conector e
+  reporta "tool não existe" (parece bug de permissão, não é).
+- **Allowlist de egress** (passo manual, só via UI do claude.ai): ícone do
+  environment da rotina → engrenagem → liberar `lab.idealtrends.io`,
+  `api.telegram.org`, `*.atlassian.net` e `api.bitbucket.org`. Sem isso o POST
+  no Lab morre em timeout sem mensagem clara.
 
-   Enviar: POST em /saude-entrega/daily (Inertia: renove a sessão com um
-   GET, extraia o XSRF-TOKEN do cookie e mande no header x-xsrf-token;
-   sucesso = HTTP 302). Campos: initiative_id=<MINHA_INICIATIVA>,
-   checkin_date=hoje, yesterday_text, today_text, confidence_score=5,
-   blockers_text="".
+### B.3 — Dar contexto do **seu** jeito de escrever
 
-   Notificar (se Telegram configurado): sendMessage com ✅ + resumo em
-   sucesso, ❌ + causa provável em falha (ex.: cookie expirado).
-   ```
+Esta é a parte que muda a qualidade do resultado. O agente não tem histórico:
+sem exemplos, ele escreve um check-in genérico de LLM ("Realizei atividades de
+desenvolvimento e correções") — correto e sem graça, e o time percebe.
 
-   Substitua `<MINHA_INICIATIVA>` e informe onde estão as credenciais (cole o
-   config.json/cookie nos secrets ou no ambiente da rotina — **nunca** no
-   texto do prompt se a rotina for compartilhada).
-3. **Allowlist de egress** (passo manual, só via UI do claude.ai): no ícone do
-   environment da rotina → engrenagem → liberar `lab.idealtrends.io`,
-   `api.telegram.org`, `*.atlassian.net` e `api.bitbucket.org`.
-4. **Testar**: rode a rotina manualmente uma vez (pela UI de routines) num
-   dia em que o check-in ainda não foi preenchido, e confira o resultado no
-   Lab e no Telegram. Com o bot configurado, `/testar` valida as credenciais
-   guardadas no `/config` a qualquer momento.
+O Lab **não** expõe endpoint de check-ins anteriores (a página só devolve os
+cards de hoje), então os exemplos têm que ser colados por você, uma vez, no
+prompt da rotina. Vale a pena: cole 2–3 check-ins reais seus no bloco
+`Estilo` do prompt e ajuste as regras de estilo para o que é verdade sobre
+você. Perguntas que ajudam a preencher isso:
+
+- Você escreve em frases corridas ou em bullets?
+- Cita código de task (`PROJ-123`) ou fala do assunto por extenso?
+- Fala em 1ª pessoa ("Finalizei…") ou impessoal ("Finalizada…")?
+- Quantas linhas costuma ter? Duas? Uma para cada frente de trabalho?
+- Usa termos do domínio que só o time entende (nome de módulo, de cliente)?
+- Como você escreve um dia parado — "sem entregas" ou omite?
+
+Revise o bloco depois da primeira semana: se o texto gerado estiver escorregando
+para o genérico, quase sempre é exemplo de menos, não regra de mais.
+
+### B.4 — Roteiro do prompt
+
+A primeira linha carimba a versão do roteiro (a mais recente do
+`CHANGELOG.md`). É o que deixa `git pull` + `/setup-checkin` saberem se a sua
+rotina está atrasada — mantenha-a atualizada quando reescrever o prompt.
+
+```text
+# lab-checkin roteiro <VERSAO_DO_CHANGELOG>
+
+Você preenche meu check-in diário de Saúde da Entrega no Ideal Lab.
+
+Guardas (pare silenciosamente se qualquer uma valer):
+1. Fim de semana ou feriado nacional/SP (calcule os móveis: Carnaval,
+   Sexta Santa, Corpus Christi).
+2. O dia de hoje consta na mensagem fixada do meu chat com o
+   @CheckInLabBot (leia via getChat da API do Telegram; formato
+   "SKIP: YYYY-MM-DD, ..."). Nesse caso, notifique 🚫 e pare.
+3. O check-in de hoje já está preenchido (GET na página
+   /saude-entrega/daily autenticado com meu cookie remember_web; os
+   cards vêm no atributo data-page).
+
+Coleta: minhas issues do Jira atualizadas desde o último dia útil
+(assignee = eu) e meus commits no Bitbucket desde então (repos do
+config; vazio = todos do workspace). Um commit é meu se o author.raw
+contiver o meu e-mail OU o meu username do Bitbucket — não filtre só
+pelo display name da conta Atlassian, isso descarta commits em silêncio.
+
+Estilo — escreva como EU escrevo, não como um assistente escreveria.
+Regras (ajuste para o seu caso):
+- 1ª pessoa, tom de daily falada, direto ao ponto.
+- Não cite código de task (PROJ-123); fale do assunto por extenso.
+- Agrupe commits em realizações lógicas, não liste commit a commit.
+- 2 a 4 linhas por campo; sem preâmbulo ("Hoje eu irei...") e sem
+  fechamento ("Qualquer dúvida, estou à disposição").
+- Nunca invente: se a atividade não aparece no Jira/Bitbucket, não entra.
+
+Exemplos reais meus (imite o tom e o tamanho, não o conteúdo):
+  Ontem: "Fechei o ajuste de permissão do módulo de auditoria e subi a
+  correção do relatório que estava duplicando linha. Comecei a olhar o
+  import de planilha, que está estourando memória em arquivo grande."
+  Hoje: "Termino o import de planilha processando em lote e volto para os
+  testes do fluxo de aprovação."
+  [COLE AQUI MAIS 1–2 CHECK-INS SEUS DE VERDADE]
+
+Gerar: "Ontem" (o que fiz) e "Hoje" (o que farei), seguindo o Estilo
+acima. Último dia útil foi feriado/fds → "Ontem" em branco.
+
+Enviar: POST em /saude-entrega/daily (Inertia: renove a sessão com um
+GET, extraia o XSRF-TOKEN do cookie e mande no header x-xsrf-token).
+Campos: initiative_id=<MINHA_INICIATIVA>, checkin_date=hoje,
+yesterday_text, today_text, confidence_score=5, blockers_text="".
+
+Confirmar: o 302 não prova envio — o Inertia responde 302 também quando
+a validação reprova. Refaça o GET e confira que o card da iniciativa
+veio com "existing"; se não veio, leia props.errors do data-page desse
+mesmo GET (é onde o Inertia entrega os erros; pode vir em
+props.errors.default), me notifique ❌ citando campo + mensagem e diga
+quais desses campos não estão no payload acima — esses são campos novos
+do formulário, que preciso mapear no script. Preencho o dia na mão.
+
+Notificar (se Telegram configurado): sendMessage com ✅ + resumo em
+sucesso, ❌ + causa provável em falha (ex.: cookie expirado).
+```
+
+Substitua `<MINHA_INICIATIVA>`, troque os exemplos do bloco `Estilo` pelos
+seus e informe onde estão as credenciais.
+
+### B.5 — Testar
+
+Rode a rotina manualmente uma vez (pela UI de routines) num dia em que o
+check-in ainda não foi preenchido, e confira **o texto** no Lab — não só se
+enviou. Se soou genérico, o ajuste é no bloco `Estilo`, não nas credenciais.
+Com o bot configurado, `/testar` valida as credenciais guardadas no `/config`
+a qualquer momento.
 
 > 💡 Conectores: se você tiver o **Atlassian MCP** conectado na sua conta, a
 > rotina pode ler o Jira por ele (dispensa o token). O envio ao Lab usa o
@@ -144,6 +256,34 @@ automático respeita as mesmas guardas dos outros modos.
 
 ---
 
+## Mantendo atualizado
+
+O repo muda: campo novo no formulário do Lab, ajuste na coleta, guarda nova. O
+`CHANGELOG.md` diz, por versão, **o que aquilo exige de você**:
+
+```bash
+git pull
+claude        # na pasta do repo
+```
+
+Se a sua versão aplicada estiver atrás, o Claude abre a sessão resumindo o que
+mudou e oferece atualizar. Se preferir puxar você mesmo: *"leia o CHANGELOG e
+atualize minha rotina"* ou `/setup-checkin`.
+
+| Tag no changelog | O que você faz |
+|---|---|
+| `[rotina]` | Sua rotina no claude.ai está desatualizada — deixe o Claude reescrever o prompt dela (ele mostra o que muda antes, e não mexe no seu bloco `Estilo` sem você pedir) |
+| `[cli]` | Nada além do `git pull` |
+| `[extensão]` | `git pull` + recarregar em `chrome://extensions` |
+| `[worker]` | Nada — o admin faz o deploy; quem usa `/runner on` já pega pronto |
+| `[setup]` | Nada, só afeta quem está configurando pela primeira vez |
+
+A versão aplicada fica em `.checkin-version` (local, fora do git). O roteiro da
+sua rotina carrega o mesmo carimbo na primeira linha — é assim que dá para saber
+se ela está atrasada sem reler o prompt inteiro.
+
+---
+
 ## Validação e problemas comuns
 
 | Sintoma | Causa provável | Correção |
@@ -153,4 +293,8 @@ automático respeita as mesmas guardas dos outros modos.
 | Rascunho vazio | Sem issues/commits no período, ou username do Bitbucket não bate com o autor dos commits | Confira o campo username / deixe vazio para auto-detectar |
 | Nada chega no Telegram | chat_id errado ou cadastro não aprovado | `/start` de novo; use o botão 🧪 da extensão para validar token+chat_id |
 | Workspace com muitos repos ficou lento | Auto-descoberta varre repo a repo (e trunca em 100) | Liste os repos no config (melhoria `project_key` no roadmap) |
+| Texto enviado soou genérico ("realizei atividades de desenvolvimento") | Poucos exemplos no bloco `Estilo` do prompt (modo B) | Cole 2–3 check-ins reais seus no bloco `Estilo` (B.3) e rode de novo |
+| Rotina diz "tool não existe" (modo B) | `allowed_tools` sem `ToolSearch` | Adicione `ToolSearch` junto dos `mcp__<conector>` (B.2) |
+| Rotina trava/timeout no envio (modo B) | Egress do environment não liberado | Liberar `lab.idealtrends.io` e os demais domínios na UI do claude.ai (B.2) |
+| ❌ "o Lab reprovou o envio: `campo` (…) — campo novo no formulário" | O formulário do Lab ganhou um campo (provavelmente obrigatório) que o script não preenche | Preencher o dia na mão e mandar a mensagem para o admin: o nome do campo vem na própria notificação (sai do `props.errors` do Inertia) e precisa entrar no payload em `checkin.sh`, `extension/lib.js` e `worker.js` — e no roteiro da sua rotina (`/setup-checkin` reescreve) |
 | Trabalho em 2+ projetos misturado num form só | Roteamento multi-iniciativa ainda não implementado | Roadmap (Fase 4) — por ora use a iniciativa do projeto atual |

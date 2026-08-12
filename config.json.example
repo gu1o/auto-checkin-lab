@@ -11,7 +11,8 @@
     "workspace": "your-workspace-id",
     "project_key": "",
     "repositories": ["auditoriaideal"],
-    "repositories_exclude": ["-old$"]
+    "repositories_exclude": ["-old$"],
+    "author_emails": []
   },
   "llm_provider": "gemini",
   "gemini": {

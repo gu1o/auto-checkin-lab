@@ -241,6 +241,19 @@ async function fetchBitbucket(cfg, sinceStr, reposOverride) {
     }
   }
 
+  // Casa por e-mail (vem no author.raw de todo commit) alem do username: o nome
+  // do autor no git costuma divergir do display name da conta Atlassian, e so
+  // o username derrubava commits em silencio. Espelha _commit_is_mine do
+  // auto_activity.py.
+  const emails = [cfg.bbAuthorEmails || cfg.jiraEmail].filter(Boolean)
+    .join(',').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+  const commitIsMine = (raw) => {
+    const r = (raw || '').toLowerCase();
+    if (emails.some((e) => r.includes(e))) return true;
+    if (username && r.includes(username.toLowerCase())) return true;
+    return !username && !emails.length;
+  };
+
   const commits = [];
   const sinceIso = sinceStr + 'T00:00:00Z';
 
@@ -253,7 +266,7 @@ async function fetchBitbucket(cfg, sinceStr, reposOverride) {
       for (const c of values) {
         if (c.date && c.date >= sinceIso) {
           const authorRaw = (c.author && c.author.raw) || '';
-          if (!username || authorRaw.toLowerCase().includes(username.toLowerCase())) {
+          if (commitIsMine(authorRaw)) {
             commits.push({
               repo,
               hash: c.hash ? c.hash.substring(0, 7) : '',
@@ -544,6 +557,40 @@ async function submitCheckin({ initiative, yesterday, today, confidence = 5, blo
   if (postRes.status !== 200 && postRes.status !== 302 && postRes.status !== 303) {
     throw new Error('POST retornou status HTTP ' + postRes.status);
   }
+
+  // O Inertia responde 302 tanto no sucesso quanto na validacao reprovada (volta
+  // para a mesma pagina com os erros na sessao). Se o form do Lab ganhar um campo
+  // obrigatorio novo, o status sozinho viraria um sucesso falso — so o card
+  // preenchido prova que gravou. E os erros flasheados vem neste mesmo GET,
+  // nomeando o campo que reprovou (inclusive um que o payload nem manda).
+  const page = await fetchPageProps();
+  const cards = page.props?.cards || [];
+  if (!cards.some(c => c.initiativeId === Number(initiative) && c.existing)) {
+    throw new Error(submitFailureDetail(page, payload, postRes.status));
+  }
+}
+
+// Erros de validacao do Lab como [campo, mensagem] (props.errors do Inertia).
+function labErrors(page) {
+  let errs = page.props?.errors || {};
+  const vals = Object.values(errs);
+  if (vals.length === 1 && vals[0] && typeof vals[0] === 'object' && !Array.isArray(vals[0])) errs = vals[0];
+  return Object.entries(errs).map(([f, m]) => [f, Array.isArray(m) ? m[0] : String(m)]);
+}
+
+// Espelha submitFailureDetail do worker.js: cita os campos reprovados e destaca
+// os que o payload nem manda (= campo novo no formulario do Lab).
+function submitFailureDetail(page, payload, status) {
+  const errs = labErrors(page);
+  if (!errs.length) {
+    return 'O Lab respondeu ' + status + ' mas o check-in nao aparece no card. ' +
+      'Provavelmente o formulario ganhou um campo obrigatorio novo: preencha manualmente hoje e avise o admin.';
+  }
+  const novos = errs.filter(([f]) => !(f in payload)).map(([f]) => f);
+  return 'O Lab reprovou o envio: ' + errs.map(([f, m]) => `${f} (${m})`).join('; ') +
+    (novos.length
+      ? `. Campo${novos.length > 1 ? 's' : ''} novo${novos.length > 1 ? 's' : ''} no formulario que a extensao nao preenche: ${novos.join(', ')} — preencha manualmente hoje e avise o admin.`
+      : '.');
 }
 
 // --- Telegram (notificacoes + /pular) ----------------------------------------------

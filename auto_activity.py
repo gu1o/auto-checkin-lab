@@ -131,6 +131,31 @@ def _repo_matches(pattern, repo):
         return p.lower() in r.lower()
 
 
+def _author_identities(config):
+    """Identidades que marcam um commit como "meu": os e-mails
+    (`bitbucket.author_emails`, senao o e-mail do Jira) e o `username`. O nome
+    do autor no git costuma divergir do display name da conta Atlassian
+    ("Guio" vs "Guilherme Ribeiro"), entao casar so por username derruba
+    commits em silencio; o e-mail vem no `author.raw` de todo commit."""
+    bb_cfg = config.get("bitbucket", {})
+    emails = bb_cfg.get("author_emails") or []
+    if not emails:
+        jira_email = config.get("jira", {}).get("email")
+        emails = [jira_email] if jira_email else []
+    return [e.strip().lower() for e in emails if e]
+
+
+def _commit_is_mine(author_raw, username, emails):
+    """True se o commit e do dev. Sem username e sem e-mail configurados,
+    aceita tudo (comportamento anterior de coleta aberta)."""
+    raw = (author_raw or "").lower()
+    if any(e in raw for e in emails):
+        return True
+    if username and username.lower() in raw:
+        return True
+    return not username and not emails
+
+
 def _select_repos(universe, patterns, exclude):
     """Seleciona repos do `universe` (slugs do workspace) casando `patterns`
     (regex/substring). Sem patterns => todos. Aplica `exclude` por fim.
@@ -285,6 +310,7 @@ def get_bitbucket_activity(config, since_date):
     # sem listar slug a slug; um slug exato continua valendo (casa consigo).
     # `repositories_exclude` remove padroes (ex.: o repo antigo "...-old").
     # Sem `repositories`, mantem o comportamento anterior (project_key > todos).
+    author_emails = _author_identities(config)
     patterns = bb_cfg.get("repositories", []) or []
     exclude = bb_cfg.get("repositories_exclude", []) or []
     project_key = bb_cfg.get("project_key")
@@ -318,11 +344,9 @@ def get_bitbucket_activity(config, since_date):
             values = data.get("values", [])
             for c in values:
                 author_raw = c.get("author", {}).get("raw", "")
-                # Check author name/username matches or is blank/none (we check if username is in raw or if we just filter by since_date)
                 date_str = c.get("date")
                 if date_str and date_str >= since_iso:
-                    # Filter by username in raw author field
-                    if username.lower() in author_raw.lower() or not username:
+                    if _commit_is_mine(author_raw, username, author_emails):
                         commits.append({
                             "repo": repo,
                             "hash": c.get("hash")[:7] if c.get("hash") else "",

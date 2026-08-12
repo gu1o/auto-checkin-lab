@@ -159,6 +159,33 @@ sys.exit(1)
 ' "$init_id"
 }
 
+submit_failure() {
+    # Depois do POST: imprime o motivo se o check-in NAO gravou (silencio = gravou).
+    # O Inertia flasheia os erros de validacao na sessao e eles voltam em
+    # props.errors deste GET — e assim que sabemos o nome de um campo novo do
+    # formulario, sem adivinhar. Uso: submit_failure <initiative_id> <payload_json>
+    page_props | python3 -c '
+import json, sys
+props = json.load(sys.stdin)["props"]
+init, payload = int(sys.argv[1]), json.loads(sys.argv[2])
+if any(c["initiativeId"] == init and c.get("existing") for c in props.get("cards", [])):
+    sys.exit(0)
+errs = props.get("errors") or {}
+vals = list(errs.values())
+if len(vals) == 1 and isinstance(vals[0], dict):  # bag nomeado
+    errs = vals[0]
+items = [(f, m[0] if isinstance(m, list) else m) for f, m in errs.items()]
+if not items:
+    print("o Lab aceitou a requisicao mas o check-in nao aparece no card — o formulario provavelmente ganhou um campo obrigatorio novo")
+else:
+    msg = "o Lab reprovou o envio: " + "; ".join(f"{f} ({m})" for f, m in items)
+    novos = [f for f, _ in items if f not in payload]
+    if novos:
+        msg += " — campo(s) novo(s) no formulario que o script nao preenche: " + ", ".join(novos)
+    print(msg)
+' "$1" "$2"
+}
+
 is_skipped() {
     # Respeita o /pular do bot: le a mensagem fixada do chat com o
     # @CheckInLabBot ("SKIP: YYYY-MM-DD, ...") via getChat. Mesmo contrato do
@@ -482,8 +509,23 @@ PY
         --data-raw "$payload" \
         "$ENDPOINT")"
 
-    # Inertia responde o POST com 302 (redirect de volta) em caso de sucesso
+    # Inertia responde 302 (redirect de volta) tanto no sucesso quanto na
+    # validacao reprovada — os erros ficam na sessao, nao no status. Se o form
+    # do Lab ganhar um campo obrigatorio novo, o 302 sozinho seria um sucesso
+    # falso: quem prova que gravou e o card preenchido.
     if [ "$http_code" = "302" ] || [ "$http_code" = "303" ] || [ "$http_code" = "200" ]; then
+        # (a pagina so devolve os cards de hoje; com --date no passado nao da para conferir)
+        local detail=""
+        if [ "$date" = "$(date +%F)" ]; then
+            # ponytail: falha em reler a pagina (rede/sessao) nao vira erro de envio — o
+            # POST pode ter gravado; nesse caso confia no status, como antes.
+            detail="$(submit_failure "$initiative" "$payload" || true)"
+        fi
+        if [ -n "$detail" ]; then
+            echo "ERRO: iniciativa $initiative — $detail." >&2
+            echo "      Preencha o check-in de hoje manualmente e avise o admin." >&2
+            exit 1
+        fi
         echo "Check-in enviado (HTTP $http_code) — iniciativa $initiative, data $date"
         cmd_status
     else

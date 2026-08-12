@@ -55,6 +55,7 @@ const HELP =
   '/testar — valida as credenciais salvas (Jira, Bitbucket, Lab, IA) sem enviar nada\n' +
   '/dryrun — gera o rascunho do check-in de hoje sem enviar\n' +
   '/agora — roda e envia o check-in agora\n' +
+  '/aprovar on|off — revisar o rascunho no chat (botoes ✅/✏️) antes de enviar\n' +
   '/runner on|off — deixa o worker enviar seu check-in automaticamente (opt-in)';
 
 export default {
@@ -617,7 +618,7 @@ function html(body, status = 200) {
       `<title>lab-checkin</title><style>
         body{font-family:system-ui,sans-serif;max-width:560px;margin:2rem auto;padding:0 1rem;color:#222}
         label{display:block;margin:.8rem 0 .2rem;font-weight:600;font-size:.9rem}
-        input,select{width:100%;padding:.5rem;border:1px solid #bbb;border-radius:6px;box-sizing:border-box}
+        input,select,textarea{width:100%;padding:.5rem;border:1px solid #bbb;border-radius:6px;box-sizing:border-box;font:inherit}
         button{margin-top:1.2rem;padding:.6rem 1.4rem;border:0;border-radius:6px;background:#2563eb;color:#fff;font-size:1rem;cursor:pointer}
         h1{font-size:1.3rem} h2{font-size:1rem;margin-top:1.5rem;border-bottom:1px solid #eee;padding-bottom:.3rem}
         .hint{color:#666;font-size:.8rem;margin-top:.2rem}
@@ -647,6 +648,10 @@ function setupForm(code) {
       <select name="llm_provider"><option value="gemini">Gemini</option><option value="claude">Claude</option></select>
       <label>Gemini API key</label><input name="gemini_key" type="password">
       <label>Anthropic API key</label><input name="anthropic_key" type="password" placeholder="sk-ant-...">
+      <h2>Estilo de escrita</h2>
+      <label>Como voce escreve seu check-in (opcional)</label>
+      <textarea name="style" rows="8" placeholder="Cole 2-3 check-ins seus de verdade (o par Ontem/Hoje) e/ou regras: bullets ou frases corridas, 1a pessoa, citar ou nao codigo de task..."></textarea>
+      <div class="hint">Sem isso o texto sai correto e generico. O que voce colar aqui vira exemplo para a IA imitar todo dia.</div>
       <h2>Ideal Lab</h2>
       <label>Nome do cookie remember_web</label><input name="lab_cookie_name" placeholder="remember_web_xxxxxxxx">
       <div class="hint">DevTools (F12) &rarr; Application &rarr; Cookies &rarr; lab.idealtrends.io</div>
@@ -702,6 +707,7 @@ async function handleSetup(request, url, env) {
       gemini: { api_key: f('gemini_key') },
       anthropic: { api_key: f('anthropic_key') },
       lab: { cookie_name: f('lab_cookie_name'), cookie_value: f('lab_cookie_value') },
+      style: f('style'),
       updated_at: new Date().toISOString(),
     };
     await env.USERS.put(`secrets:${chatId}`, await encryptJson(env, secrets));
@@ -887,6 +893,26 @@ function inScope(repo, repositories) {
   return (repositories || []).some((p) => repoMatches(p, repo));
 }
 
+/** Identidades que marcam um commit como do dev: e-mails
+ *  (bitbucket.author_emails, senao o e-mail do Jira) + username. Espelha
+ *  _author_identities do auto_activity.py. O nome do autor no git costuma
+ *  divergir do display name da conta Atlassian, entao casar so por username
+ *  derruba commits em silencio; o e-mail vem no author.raw de todo commit. */
+function authorEmails(s) {
+  const bb = (s && s.bitbucket) || {};
+  const list = (bb.author_emails && bb.author_emails.length ? bb.author_emails : [(s.jira || {}).email]) || [];
+  return list.filter(Boolean).map((e) => String(e).trim().toLowerCase());
+}
+
+/** Espelha _commit_is_mine do auto_activity.py: sem username e sem e-mail
+ *  configurados, aceita tudo (coleta aberta). */
+function commitIsMine(authorRaw, username, emails) {
+  const raw = (authorRaw || '').toLowerCase();
+  if (emails.some((e) => raw.includes(e))) return true;
+  if (username && raw.includes(username.toLowerCase())) return true;
+  return !username && !emails.length;
+}
+
 /** Lista (paginado) os slugs do workspace, filtrando por project_key se houver.
  *  Retorna null se falta workspace/credencial; senao { repos, listed }: listed
  *  distingue "listou (talvez vazio)" de "nao consegui listar (permissao/erro)". */
@@ -1046,6 +1072,7 @@ async function doPainel(env, chatId) {
   lines.push(`• Notificacoes: ${prefs.notifications ? 'on' : 'off'}${prefs.email ? ` (e-mail: ${prefs.email})` : ''}`);
   lines.push(`• Horario preferido: ${prefs.time || '(nao definido)'}`);
   lines.push(`• Runner do worker: ${prefs.runner === 'worker' ? 'ATIVADO (o worker envia seu check-in)' : 'desativado'}`);
+  lines.push(`• Aprovacao antes de enviar: ${prefs.approve ? 'ligada (/aprovar off para enviar direto)' : 'desligada (/aprovar on para revisar)'}`);
   lines.push('');
 
   if (error === 'decrypt') {
@@ -1067,6 +1094,7 @@ async function doPainel(env, chatId) {
     lines.push(`• LLM: provider ${provider}${keys.length ? `, chaves: ${keys.join(', ')}` : ', nenhuma chave'}`);
     const lab = secrets.lab || {};
     lines.push(`• Ideal Lab: ${lab.cookie_name && lab.cookie_value ? 'cookie configurado' : 'cookie nao configurado'}`);
+    lines.push(`• Estilo de escrita: ${secrets.style ? `${secrets.style.length} caracteres de exemplo` : 'nao definido (texto sai generico) — preencha no /config'}`);
   }
 
   lines.push('');
@@ -1191,6 +1219,7 @@ async function bitbucketActivity(secrets, sinceIso) {
       /* token so-repositorio nao acessa /user; segue sem filtro de autor */
     }
   }
+  const emails = authorEmails(secrets);
   const patterns = bb.repositories || [];
   const exclude = bb.repositories_exclude || [];
   const res = await listWorkspaceRepos(secrets);
@@ -1216,7 +1245,7 @@ async function bitbucketActivity(secrets, sinceIso) {
     for (const c of data.values || []) {
       const authorRaw = (c.author && c.author.raw) || '';
       const dateStr = c.date;
-      if (dateStr && dateStr >= sinceIso && (!username || authorRaw.toLowerCase().includes(username.toLowerCase()))) {
+      if (dateStr && dateStr >= sinceIso && commitIsMine(authorRaw, username, emails)) {
         commits.push({ repo, hash: (c.hash || '').slice(0, 7), message: (c.message || '').trim().split('\n')[0], date: dateStr });
       }
     }
@@ -1276,7 +1305,7 @@ function routeActivity(jira, bb, initiativeConfig, defaultInit) {
 
 // --- geracao de texto (Claude/Gemini/template) -----------------------------------
 
-function genPrompt(ctx) {
+function genPrompt(ctx, style) {
   return (
     'Você é um desenvolvedor preenchendo o check-in diário de atividades.\n' +
     'Com base nas atividades brutas do Jira e Bitbucket abaixo, gere dois blocos de texto em português (um "yesterday", um "today").\n\n' +
@@ -1286,13 +1315,18 @@ function genPrompt(ctx) {
     '3. Não cite códigos de tasks (ex: evite "PROJ-123"). Fale do assunto de forma natural.\n' +
     '4. Sintetize; agrupe commits em realizações lógicas em vez de listar literalmente.\n' +
     '5. Para "today", deduza o que fazer com base nas tarefas não concluídas (In Progress/pendentes) ou continuação.\n' +
-    '6. Responda estritamente no JSON: {"yesterday": "...", "today": "..."}\n\n' +
-    'Dados de atividade:\n' +
+    '6. Responda estritamente no JSON: {"yesterday": "...", "today": "..."}\n' +
+    (style
+      ? '\nEstilo do dev — imite o tom, o tamanho e o vocabulário do que vem abaixo ' +
+        '(é a voz dele; as regras acima cedem quando conflitarem com ela). Nunca copie o conteúdo, só a forma:\n' +
+        style + '\n'
+      : '') +
+    '\nDados de atividade:\n' +
     JSON.stringify(ctx, null, 2)
   );
 }
 
-async function generateClaude(apiKey, jira, bb) {
+async function generateClaude(apiKey, jira, bb, style) {
   const ctx = { jira_issues_updated: jira, bitbucket_commits: bb };
   let r;
   try {
@@ -1313,7 +1347,7 @@ async function generateClaude(apiKey, jira, bb) {
             },
           },
         },
-        messages: [{ role: 'user', content: genPrompt(ctx) }],
+        messages: [{ role: 'user', content: genPrompt(ctx, style) }],
       }),
     });
   } catch {
@@ -1331,7 +1365,7 @@ async function generateClaude(apiKey, jira, bb) {
   }
 }
 
-async function generateGemini(apiKey, jira, bb) {
+async function generateGemini(apiKey, jira, bb, style) {
   const ctx = { jira_issues_updated: jira, bitbucket_commits: bb };
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
   let r;
@@ -1339,7 +1373,7 @@ async function generateGemini(apiKey, jira, bb) {
     r = await rfetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: genPrompt(ctx) }] }], generationConfig: { responseMimeType: 'application/json' } }),
+      body: JSON.stringify({ contents: [{ parts: [{ text: genPrompt(ctx, style) }] }], generationConfig: { responseMimeType: 'application/json' } }),
     });
   } catch {
     return null;
@@ -1383,18 +1417,23 @@ function generateTemplate(jira, bb) {
   return { yesterday, today };
 }
 
-async function buildCheckinText(secrets, jira, bb, yesterdayIsHoliday) {
+// `feedback` vem do "✏️ Refazer": o contexto que o dev mandou depois de recusar
+// o rascunho, somado ao estilo salvo no /config.
+async function buildCheckinText(secrets, jira, bb, yesterdayIsHoliday, feedback) {
   let y = null;
   let t = null;
+  const style = [secrets.style, feedback && `Ajustes que o dev pediu neste rascunho (prioridade máxima):\n${feedback}`]
+    .filter(Boolean)
+    .join('\n\n');
   const provider = secrets.llm_provider || 'gemini';
   if (provider === 'claude' && secrets.anthropic?.api_key) {
-    const r = await generateClaude(secrets.anthropic.api_key, jira, bb);
+    const r = await generateClaude(secrets.anthropic.api_key, jira, bb, style);
     if (r) ({ yesterday: y, today: t } = r);
   } else if (secrets.gemini?.api_key) {
-    const r = await generateGemini(secrets.gemini.api_key, jira, bb);
+    const r = await generateGemini(secrets.gemini.api_key, jira, bb, style);
     if (r) ({ yesterday: y, today: t } = r);
   } else if (secrets.anthropic?.api_key) {
-    const r = await generateClaude(secrets.anthropic.api_key, jira, bb);
+    const r = await generateClaude(secrets.anthropic.api_key, jira, bb, style);
     if (r) ({ yesterday: y, today: t } = r);
   }
   if (!y || !t) {
@@ -1416,6 +1455,17 @@ function decodeEntities(s) {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&');
+}
+
+/** JSON do Inertia embutido no HTML (atributo data-page), ou null. */
+function parseDataPage(htmlBody) {
+  const m = htmlBody.match(/data-page="([^"]*)"/);
+  if (!m) return null;
+  try {
+    return JSON.parse(decodeEntities(m[1]));
+  } catch {
+    return null; /* props ausente: guardas por-iniciativa ficam permissivas */
+  }
 }
 
 async function labSession(secrets) {
@@ -1441,17 +1491,37 @@ async function labSession(secrets) {
   const xsrf = xsrfRaw ? decodeURIComponent(xsrfRaw) : '';
   const cookieHeader = Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
 
-  const htmlBody = await r.text();
-  const m = htmlBody.match(/data-page="([^"]*)"/);
-  let props = null;
-  if (m) {
-    try {
-      props = JSON.parse(decodeEntities(m[1]));
-    } catch {
-      /* props ausente: guardas por-iniciativa ficam permissivas */
-    }
-  }
+  const props = parseDataPage(await r.text());
   return { ok: true, cookieHeader, xsrf, props };
+}
+
+/** Erros de validacao do Lab, como [campo, mensagem]. O Inertia flasheia o bag
+ *  na sessao e ele aparece em props.errors da resposta seguinte — que e o GET de
+ *  confirmacao do labSubmit. E assim que descobrimos o nome de um campo novo do
+ *  formulario sem precisar adivinhar nem guardar estado. */
+function labErrors(props) {
+  let errs = props?.props?.errors || {};
+  const vals = Object.values(errs);
+  // bag nomeado (props.errors.default = {campo: msg})
+  if (vals.length === 1 && vals[0] && typeof vals[0] === 'object' && !Array.isArray(vals[0])) errs = vals[0];
+  return Object.entries(errs).map(([f, m]) => [f, Array.isArray(m) ? m[0] : String(m)]);
+}
+
+/** Mensagem de falha do envio, citando os campos reprovados e destacando os que
+ *  o payload nem manda (= campo novo no form do Lab). De proposito NAO tentamos
+ *  preencher esse campo: sem saber o tipo (escala, enum, boolean) qualquer chute
+ *  vira dado errado na metrica. Mapear o campo e edicao humana. */
+function submitFailureDetail(props, payload, status) {
+  const errs = labErrors(props);
+  if (!errs.length) {
+    return `o Lab respondeu ${status} mas o check-in nao aparece no card — o formulario provavelmente ganhou um campo obrigatorio novo; preencha manualmente hoje e avise o admin`;
+  }
+  const novos = errs.filter(([f]) => !(f in payload)).map(([f]) => f);
+  const lista = errs.map(([f, m]) => `${f} (${m})`).join('; ');
+  return `o Lab reprovou o envio: ${lista}` +
+    (novos.length
+      ? ` — campo${novos.length > 1 ? 's' : ''} novo${novos.length > 1 ? 's' : ''} no formulario que o script nao preenche: ${novos.join(', ')}. Preencha manualmente hoje e avise o admin`
+      : '');
 }
 
 function labIsSubmitted(props, initId) {
@@ -1492,13 +1562,45 @@ async function labSubmit(session, { initiative, date, yesterday, today, confiden
   } catch (e) {
     return { ok: false, status: 0 };
   }
-  const ok = r.status === 200 || r.status === 302 || r.status === 303;
-  return { ok, status: r.status };
+  if (!(r.status === 200 || r.status === 302 || r.status === 303)) return { ok: false, status: r.status };
+
+  // O Inertia responde 302 tanto no sucesso quanto na validacao reprovada (ele
+  // redireciona de volta com os erros na sessao). Se o form do Lab ganhar um
+  // campo obrigatorio novo, o 302 sozinho viraria um ✅ falso: so o card
+  // preenchido prova que gravou. Sem conseguir reler, confia no status.
+  try {
+    const g = await rfetch(LAB_ENDPOINT, {
+      headers: { accept: 'text/html', 'user-agent': LAB_UA, cookie: session.cookieHeader },
+      redirect: 'manual',
+    });
+    const props = g.ok ? parseDataPage(await g.text()) : null;
+    if (props && !labIsSubmitted(props, initiative)) {
+      return { ok: false, status: r.status, error: submitFailureDetail(props, payload, r.status) };
+    }
+  } catch {
+    /* sem confirmacao: nao derruba um envio que pode ter dado certo */
+  }
+  return { ok: true, status: r.status };
 }
 
 // --- orquestracao ----------------------------------------------------------------
 
-async function runCheckin(env, chatId, { dryRun = false, force = false } = {}) {
+function labSessionError(session) {
+  return session.error === 'redirect'
+    ? 'cookie remember_web expirado — relogue no Lab e refaca o /config'
+    : session.error === 'cookie'
+      ? 'cookie do Lab nao configurado (use /config)'
+      : `sessao do Lab falhou (${session.error})`;
+}
+
+function draftText(checkins, warnings, header) {
+  const out = [header];
+  if (warnings && warnings.length) out.push('⚠️ ' + warnings.join(' | '));
+  for (const c of checkins) out.push(`\n=== Iniciativa ${c.initiative} ===\nONTEM:\n${c.yesterday}\n\nHOJE:\n${c.today}`);
+  return out.join('\n');
+}
+
+async function runCheckin(env, chatId, { dryRun = false, force = false, approve = false } = {}) {
   const { secrets, error } = await loadSecrets(env, chatId);
   if (error === 'decrypt') return '❌ Nao consegui ler suas credenciais. Refaca o /config.';
   if (!secrets) return 'Sem credenciais salvas. Configure com /config.';
@@ -1525,9 +1627,11 @@ async function runCheckin(env, chatId, { dryRun = false, force = false } = {}) {
 
   const checkins = [];
   let warnings = [];
+  // jira/bb ficam junto de cada check-in: o "✏️ Refazer" regera o texto a partir
+  // da mesma atividade, sem recoletar Jira/Bitbucket.
   if (!hasMap) {
     const { yesterday, today } = await buildCheckinText(secrets, jira, bb, yHol);
-    checkins.push({ initiative: defaultInit, yesterday, today });
+    checkins.push({ initiative: defaultInit, yesterday, today, jira, bb });
   } else {
     const routed = routeActivity(jira, bb, ic, defaultInit);
     warnings = routed.warnings;
@@ -1535,31 +1639,24 @@ async function runCheckin(env, chatId, { dryRun = false, force = false } = {}) {
       const bkt = routed.buckets[id];
       if (!bkt.jira.length && !bkt.bb.length) continue;
       const { yesterday, today } = await buildCheckinText(secrets, bkt.jira, bkt.bb, yHol);
-      checkins.push({ initiative: id, yesterday, today });
+      checkins.push({ initiative: id, yesterday, today, jira: bkt.jira, bb: bkt.bb });
     }
     if (!checkins.length) {
       const { yesterday, today } = await buildCheckinText(secrets, [], [], yHol);
-      checkins.push({ initiative: defaultInit, yesterday, today });
+      checkins.push({ initiative: defaultInit, yesterday, today, jira: [], bb: [] });
     }
   }
 
-  if (dryRun) {
-    const out = ['🧪 DRY RUN — nada foi enviado ao Lab.'];
-    if (warnings.length) out.push('⚠️ ' + warnings.join(' | '));
-    for (const c of checkins) out.push(`\n=== Iniciativa ${c.initiative} ===\nONTEM:\n${c.yesterday}\n\nHOJE:\n${c.today}`);
-    return out.join('\n');
+  if (dryRun) return draftText(checkins, warnings, '🧪 DRY RUN — nada foi enviado ao Lab.');
+
+  if (approve) {
+    await putDraft(env, chatId, { date: t, yHol, warnings, checkins });
+    await send(env, chatId, draftText(checkins, warnings, '📝 Rascunho do check-in de hoje — confirme para eu enviar:'), APPROVE_KB);
+    return ''; // quem chama nao manda mensagem extra; a decisao e do dev
   }
 
   const session = await labSession(secrets);
-  if (!session.ok) {
-    const msg =
-      session.error === 'redirect'
-        ? 'cookie remember_web expirado — relogue no Lab e refaca o /config'
-        : session.error === 'cookie'
-          ? 'cookie do Lab nao configurado (use /config)'
-          : `sessao do Lab falhou (${session.error})`;
-    return `❌ ${msg}`;
-  }
+  if (!session.ok) return `❌ ${labSessionError(session)}`;
 
   const results = [];
   if (warnings.length) results.push('⚠️ ' + warnings.join(' | '));
@@ -1569,9 +1666,117 @@ async function runCheckin(env, chatId, { dryRun = false, force = false } = {}) {
       continue;
     }
     const r = await labSubmit(session, { initiative: c.initiative, date: t, yesterday: c.yesterday, today: c.today });
-    results.push(r.ok ? `✅ Iniciativa ${c.initiative} enviada (HTTP ${r.status}).` : `❌ Iniciativa ${c.initiative}: HTTP ${r.status}.`);
+    results.push(r.ok ? `✅ Iniciativa ${c.initiative} enviada (HTTP ${r.status}).` : `❌ Iniciativa ${c.initiative}: ${r.error || `HTTP ${r.status}`}.`);
   }
   return results.join('\n');
+}
+
+// --- aprovacao do rascunho (opt-in por /aprovar) ---------------------------------
+// Com prefs.approve, o runner NAO envia direto: guarda o rascunho no KV
+// (draft:<chatId>, TTL de 1 dia) e manda no chat com dois botoes. "Enviar" faz o
+// POST no Lab; "Refazer" pergunta o contexto e regera a partir da MESMA atividade
+// coletada — nada de bater no Jira/Bitbucket de novo.
+
+const APPROVE_KB = {
+  inline_keyboard: [[
+    { text: '✅ Enviar', callback_data: 'ck:ok' },
+    { text: '✏️ Refazer', callback_data: 'ck:no' },
+  ]],
+};
+const ASK_FEEDBACK =
+  'O que ajustar? Responda esta mensagem com o contexto que devo usar de base ' +
+  '(ex: "faltou a migracao do modulo de auditoria", "escreve mais curto, em duas frases").';
+const DRAFT_TTL_S = 86400;
+
+function putDraft(env, chatId, draft) {
+  return env.USERS.put(`draft:${chatId}`, JSON.stringify(draft), { expirationTtl: DRAFT_TTL_S });
+}
+
+/** Rascunho de hoje, ou null (o de ontem nao serve — o check-in e do dia). */
+async function getDraft(env, chatId) {
+  const raw = await env.USERS.get(`draft:${chatId}`);
+  if (!raw) return null;
+  try {
+    const d = JSON.parse(raw);
+    return d.date === todayIso() ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendDraft(env, chatId) {
+  const draft = await getDraft(env, chatId);
+  if (!draft) {
+    await send(env, chatId, 'Nao achei um rascunho de hoje (pode ter expirado). Gere outro com /agora.');
+    return;
+  }
+  const { secrets } = await loadSecrets(env, chatId);
+  if (!secrets) {
+    await send(env, chatId, 'Sem credenciais salvas. Configure com /config.');
+    return;
+  }
+  const session = await labSession(secrets);
+  if (!session.ok) {
+    await send(env, chatId, `❌ ${labSessionError(session)}`);
+    return;
+  }
+  const results = [];
+  for (const c of draft.checkins) {
+    if (labIsSubmitted(session.props, c.initiative)) {
+      results.push(`ℹ️ Iniciativa ${c.initiative} ja preenchida hoje.`);
+      continue;
+    }
+    const r = await labSubmit(session, { initiative: c.initiative, date: draft.date, yesterday: c.yesterday, today: c.today });
+    results.push(r.ok ? `✅ Iniciativa ${c.initiative} enviada (HTTP ${r.status}).` : `❌ Iniciativa ${c.initiative}: ${r.error || `HTTP ${r.status}`}.`);
+  }
+  await env.USERS.delete(`draft:${chatId}`);
+  await send(env, chatId, results.join('\n'));
+}
+
+async function regenDraft(env, chatId, feedback) {
+  const draft = await getDraft(env, chatId);
+  if (!draft) {
+    await send(env, chatId, 'Nao achei um rascunho de hoje (pode ter expirado). Gere outro com /agora.');
+    return;
+  }
+  const { secrets } = await loadSecrets(env, chatId);
+  if (!secrets) {
+    await send(env, chatId, 'Sem credenciais salvas. Configure com /config.');
+    return;
+  }
+  await send(env, chatId, 'Refazendo o rascunho com esse contexto...');
+  const checkins = [];
+  for (const c of draft.checkins) {
+    const { yesterday, today } = await buildCheckinText(secrets, c.jira, c.bb, draft.yHol, feedback);
+    checkins.push({ ...c, yesterday, today });
+  }
+  await putDraft(env, chatId, { ...draft, checkins });
+  await send(
+    env,
+    chatId,
+    draftText(checkins, draft.warnings, '📝 Rascunho refeito — confirme para eu enviar:') +
+      '\n\n💡 Se for sempre assim que voce escreve, cole isso no campo "Estilo de escrita" do /config — ai vale para todo dia.',
+    APPROVE_KB,
+  );
+}
+
+async function doAprovar(env, chatId, arg) {
+  const user = chatId === adminId(env) ? await ensureAdminUser(env) : await getUser(env, chatId);
+  if (!user) return;
+  user.prefs = user.prefs || {};
+  const a = (arg || '').trim().toLowerCase();
+  if (a === 'on' || a === 'off') {
+    if (a === 'on') user.prefs.approve = true;
+    else delete user.prefs.approve;
+    await putUser(env, chatId, user);
+  }
+  await send(
+    env,
+    chatId,
+    `Aprovacao antes de enviar: ${user.prefs.approve ? 'LIGADA — te mando o rascunho com os botoes ✅/✏️' : 'desligada — envio direto'}.\n` +
+      '/aprovar on — revisar antes de enviar\n/aprovar off — enviar direto\n\n' +
+      'Com ela ligada, o check-in so vai para o Lab depois que voce clicar ✅ — se voce nao clicar, nao vai nada.',
+  );
 }
 
 // --- comandos do runner (opt-in + teste manual) ----------------------------------
@@ -1614,7 +1819,9 @@ async function doDryrun(env, chatId) {
 
 async function doAgora(env, chatId) {
   await send(env, chatId, 'Rodando o check-in agora (ignora o horario; respeita fim de semana/feriado/pular)...');
-  await send(env, chatId, await runCheckin(env, chatId, { force: false }));
+  const user = chatId === adminId(env) ? await ensureAdminUser(env) : await getUser(env, chatId);
+  const out = await runCheckin(env, chatId, { force: false, approve: !!user?.prefs?.approve });
+  if (out) await send(env, chatId, out); // vazio = virou rascunho para aprovar
 }
 
 // --- Cron Trigger: roda para cada usuario active que optou pelo runner -----------
@@ -1639,7 +1846,7 @@ async function runnerCron(env) {
       if (user.prefs?.runner !== 'worker') continue; // opt-in
       if (!scheduleGate(user.prefs || {})) continue; // modelo tick: so a partir do horario
       try {
-        const out = await runCheckin(env, chatId, {});
+        const out = await runCheckin(env, chatId, { approve: !!user.prefs?.approve });
         // Notifica so quando algo aconteceu de verdade (envio ✅ ou erro ❌);
         // silencia "ja preenchida"/fim de semana/feriado/pular para evitar ruido.
         if (/[✅❌]/.test(out)) await send(env, chatId, out);
@@ -1651,8 +1858,8 @@ async function runnerCron(env) {
   } while (cursor);
 }
 
-// exporta para uso futuro
-export { decryptJson };
+// exporta para uso futuro / test_draft.mjs
+export { decryptJson, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail };
 
 // --- roteamento -----------------------------------------------------------------
 
@@ -1685,6 +1892,11 @@ async function handle(update, env, origin) {
     }
     if (cmd === 'rp') {
       await handleReposCallback(env, chatId, cq.message?.message_id, arg, extra);
+      return;
+    }
+    if (cmd === 'ck') {
+      if (arg === 'ok') await sendDraft(env, chatId);
+      else await send(env, chatId, ASK_FEEDBACK, { force_reply: true });
       return;
     }
     if (cmd === 'pular') {
@@ -1727,6 +1939,8 @@ async function handle(update, env, origin) {
     await doPainel(env, chatId);
   } else if (low.startsWith('/repos')) {
     await doRepos(env, chatId);
+  } else if (low.startsWith('/aprovar')) {
+    await doAprovar(env, chatId, text.slice('/aprovar'.length).trim());
   } else if (low.startsWith('/runner')) {
     await doRunner(env, chatId, text.slice('/runner'.length).trim());
   } else if (low.startsWith('/dryrun')) {
@@ -1739,6 +1953,8 @@ async function handle(update, env, origin) {
     await doTestar(env, chatId);
   } else if (low.startsWith('/cancelar')) {
     await send(env, chatId, 'Ok, deixa pra la.');
+  } else if (msg.reply_to_message?.text?.startsWith('O que ajustar?')) {
+    await regenDraft(env, chatId, text); // contexto do "✏️ Refazer"
   } else if (msg.reply_to_message?.text?.startsWith('Qual data?')) {
     await doPular(env, chatId, parseDate(text)); // resposta ao ForceReply de "Outra data"
   } else if (msg.reply_to_message && (await handlePrefReply(env, chatId, user, msg))) {
