@@ -98,6 +98,12 @@ do navegador — estão no roadmap: `docs/plano-rollout-time.md`.)
 6. (Opcional) **Exportar config.json** — gera o arquivo pronto para os modos
    B e C, para você não redigitar nada. Estando logado no Lab, o cookie
    `remember_web` é incluído automaticamente no export.
+7. **Para receber aviso de atualização** (a extensão não deixa rastro no repo):
+   marque a versão que você está usando —
+   `grep -m1 '^## ' CHANGELOG.md | cut -d' ' -f2 > .checkin-version`. Daí em
+   diante, num `git pull` com novidade, o Claude abre a sessão contando o que
+   mudou (ver "Mantendo atualizado"). O `/setup-checkin` faz isso sozinho; no
+   modo extensão é este comando.
 
 ## Modo B — Rotina agendada no Claude Code (conta corporativa)
 
@@ -278,9 +284,11 @@ atualize minha rotina"* ou `/setup-checkin`.
 | `[worker]` | Nada — o admin faz o deploy; quem usa `/runner on` já pega pronto |
 | `[setup]` | Nada, só afeta quem está configurando pela primeira vez |
 
-A versão aplicada fica em `.checkin-version` (local, fora do git). O roteiro da
-sua rotina carrega o mesmo carimbo na primeira linha — é assim que dá para saber
-se ela está atrasada sem reler o prompt inteiro.
+A versão aplicada fica em `.checkin-version` (local, fora do git) — é a partir
+dele que o aviso dispara, inclusive para quem usa **só a extensão** e não tem
+`config.json` no repo (crie o arquivo pelo passo 7 do Modo A). O roteiro da sua
+rotina carrega o mesmo carimbo na primeira linha, então dá para saber se ela
+está atrasada sem reler o prompt inteiro.
 
 ---
 
