@@ -28,11 +28,14 @@
  * x-notify-secret == NOTIFY_SECRET; o worker entrega por Telegram (e por e-mail
  * via Resend se o dev tiver prefs.email e RESEND_API_KEY estiver setado). Tira
  * o bot_token dos configs dos devs — eles so carregam NOTIFY_SECRET + a URL.
+ * Quem nao tem Telegram manda { email, text }: entrega direto por Resend, com
+ * o dominio do destinatario conferido contra NOTIFY_EMAIL_DOMAINS.
  *
  * Env: BOT_TOKEN (secret), WEBHOOK_SECRET (secret), KV_ENC_KEY (secret,
  * 32 bytes em base64), ADMIN_CHAT_ID (var), USERS (KV namespace).
  * Opcionais: NOTIFY_SECRET (secret, habilita /notify), RESEND_API_KEY +
- * NOTIFY_EMAIL_FROM (secret/var, habilitam e-mail no /notify).
+ * NOTIFY_EMAIL_FROM (secret/var, habilitam e-mail no /notify),
+ * NOTIFY_EMAIL_DOMAINS (var, dominios aceitos no { email } do /notify).
  */
 
 const SP_TZ = 'America/Sao_Paulo';
@@ -759,16 +762,35 @@ async function sendEmail(env, to, subject, text) {
         text,
       }),
     });
+    // A recusa da Resend (dominio nao verificado, FROM invalido, key errada) so
+    // aparece no corpo — sem isso o /notify vira 502 mudo. Ver com `wrangler tail`.
+    if (!r.ok) console.log('resend recusou', r.status, await r.text());
     return r.ok;
-  } catch {
+  } catch (e) {
+    console.log('resend falhou', e);
     return false;
   }
 }
 
-// POST /notify — o runner manda { chatId, text }; o worker resolve o canal do
-// dev (Telegram sempre; e-mail via Resend se o dev tiver prefs.email e o worker
-// tiver RESEND_API_KEY). Assim o bot_token sai dos configs dos devs: eles so
-// carregam NOTIFY_SECRET + a URL do worker.
+// Destino de e-mail informado direto no corpo do /notify (dev sem Telegram):
+// so vale se o dominio estiver em NOTIFY_EMAIL_DOMAINS (lista separada por
+// virgula). Sem a var, o segredo compartilhado do time viraria relay aberto na
+// conta Resend — entao dominio nao liberado = recusa.
+function emailAllowed(email, domains) {
+  const m = /^[^\s@]+@([^\s@]+\.[^\s@]+)$/.exec((email || '').trim().toLowerCase());
+  if (!m) return false;
+  const allow = (domains || '')
+    .split(',')
+    .map((d) => d.trim().toLowerCase().replace(/^@/, ''))
+    .filter(Boolean);
+  return allow.includes(m[1]);
+}
+
+// POST /notify — { chatId, text } ou { email, text } (ou os dois). Com chatId o
+// worker resolve o canal do dev pelo KV (e-mail de prefs.email se houver,
+// Telegram caso contrario); com email no corpo entrega direto por Resend, que e
+// o caminho de quem nao tem Telegram. Assim o bot_token sai dos configs dos
+// devs: eles so carregam NOTIFY_SECRET + a URL do worker.
 async function handleNotify(request, env) {
   if (request.method === 'OPTIONS') return corsPreflight();
   if (request.method !== 'POST') return jsonCors({ ok: false, error: 'method not allowed' }, 405);
@@ -781,19 +803,31 @@ async function handleNotify(request, env) {
   } catch {
     return jsonCors({ ok: false, error: 'bad request' }, 400);
   }
-  const chatId = Number(body.chatId);
+  const chatId = Number(body.chatId) || 0;
   const text = (body.text || '').toString();
-  if (!chatId || !text) return jsonCors({ ok: false, error: 'chatId/text obrigatorios' }, 400);
+  const asked = (body.email || '').toString().trim();
+  if ((!chatId && !asked) || !text) {
+    return jsonCors({ ok: false, error: 'chatId ou email, mais text, sao obrigatorios' }, 400);
+  }
+  if (asked && !emailAllowed(asked, env.NOTIFY_EMAIL_DOMAINS)) {
+    return jsonCors({ ok: false, error: 'dominio de e-mail nao liberado em NOTIFY_EMAIL_DOMAINS' }, 403);
+  }
 
   let delivered = false;
-  const user = await getUser(env, chatId);
-  const email = user?.prefs?.email;
-  if (email) delivered = await sendEmail(env, email, 'lab-checkin', text);
-  if (!delivered) {
+  const user = chatId ? await getUser(env, chatId) : null;
+  const email = asked || user?.prefs?.email;
+  if (email) delivered = await sendEmail(env, email, 'Auto Check-in', text);
+  if (!delivered && chatId) {
     const r = await send(env, chatId, text);
     delivered = !!r.ok;
   }
-  return jsonCors({ ok: delivered });
+  // 200 com ok:false passava batido no `curl -sf` do checkin.sh (fallback nunca
+  // rodava): falha de entrega precisa ser status de erro.
+  if (!delivered) {
+    const why = email ? 'e-mail nao entregue (RESEND_API_KEY ausente ou Resend recusou)' : 'nao entregue';
+    return jsonCors({ ok: false, error: why }, 502);
+  }
+  return jsonCors({ ok: true });
 }
 
 // /devlink — deep linking com a extensao (Fase 1C).
@@ -1859,7 +1893,7 @@ async function runnerCron(env) {
 }
 
 // exporta para uso futuro / test_draft.mjs
-export { decryptJson, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail };
+export { decryptJson, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail, emailAllowed };
 
 // --- roteamento -----------------------------------------------------------------
 

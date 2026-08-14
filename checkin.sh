@@ -59,10 +59,11 @@ require_jar() {
 notify() {
     # Notifica o desfecho. Preferencia (Fase 5b): se notify.url + notify.secret
     # estiverem no config.json, manda pro worker /notify (o bot_token sai do
-    # config do dev). Senao, se telegram.bot_token/chat_id existirem, fala direto
-    # com o Telegram. Sem nada configurado, nao faz nada (fluxo dos demais devs
-    # intacto).
-    local text="$1" fields notify_url notify_secret token chat_id
+    # config do dev) com o chat_id, o notify.email ou os dois — e-mail e o canal
+    # de quem nao tem Telegram. Senao, se telegram.bot_token/chat_id existirem,
+    # fala direto com o Telegram. Sem nada configurado, nao faz nada (fluxo dos
+    # demais devs intacto).
+    local text="$1" fields notify_url notify_secret notify_email token chat_id
     [ -f "$CONFIG" ] || return 0
     fields="$(python3 -c '
 import json, sys
@@ -76,15 +77,25 @@ print(n.get("url", ""))
 print(n.get("secret", ""))
 print(t.get("bot_token", ""))
 print(str(t.get("chat_id", "")))
+print(n.get("email", ""))
 ' "$CONFIG")" || return 0
     notify_url="$(sed -n 1p <<<"$fields")"
     notify_secret="$(sed -n 2p <<<"$fields")"
     token="$(sed -n 3p <<<"$fields")"
     chat_id="$(sed -n 4p <<<"$fields")"
+    notify_email="$(sed -n 5p <<<"$fields")"
 
-    if [ -n "$notify_url" ] && [ -n "$notify_secret" ] && [ -n "$chat_id" ]; then
+    if [ -n "$notify_url" ] && [ -n "$notify_secret" ] && { [ -n "$chat_id" ] || [ -n "$notify_email" ]; }; then
         local payload
-        payload="$(python3 -c 'import json,sys; print(json.dumps({"chatId": int(sys.argv[1]), "text": sys.argv[2]}))' "$chat_id" "$text")"
+        payload="$(python3 -c '
+import json, sys
+d = {"text": sys.argv[3]}
+if sys.argv[1]:
+    d["chatId"] = int(sys.argv[1])
+if sys.argv[2]:
+    d["email"] = sys.argv[2]
+print(json.dumps(d))
+' "$chat_id" "$notify_email" "$text")"
         if curl -sf -o /dev/null --max-time 10 \
             -H "content-type: application/json" \
             -H "x-notify-secret: ${notify_secret}" \

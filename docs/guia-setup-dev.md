@@ -62,8 +62,21 @@ de base e regera na hora. Isso vale para quem roda pelo **runner do worker**
 clique.
 
 Sem Telegram? Tudo funciona igual, só sem notificação/comando remoto — deixe
-os campos de Telegram em branco. (Canais alternativos — e-mail, notificação
-do navegador — estão no roadmap: `docs/plano-rollout-time.md`.)
+os campos de Telegram em branco. Você pode receber os avisos por **e-mail**
+em vez do bot (sem `/pular`, `/testar` nem `/config` — isso é só do bot):
+
+- **Pelo worker** (qualquer domínio, inclusive Outlook/M365, e vale nos modos
+  A/B/C): peça a URL e o `NOTIFY_SECRET` ao admin e preencha `notify.url`,
+  `notify.secret` e `notify.email` no `config.json`. Se voltar 403 "dominio
+  nao liberado", o admin precisa acrescentar o seu domínio em
+  `NOTIFY_EMAIL_DOMAINS` no worker.
+- **Pelo conector Gmail** (só modo B, e só se seu e-mail for Google): a rotina
+  usa o conector da sua conta. Cuidado: se o OAuth do conector cair, é
+  justamente o aviso de falha que some.
+
+Escolher "nenhuma notificação" agora não te prende: rode `/setup-checkin` e
+diga "quero notificação" quando quiser — ele troca só o trecho de aviso da
+rotina, sem mexer nas suas credenciais nem no seu estilo de escrita.
 
 ### 0.2 Credenciais que você vai precisar
 

@@ -28,7 +28,8 @@
   },
   "notify": {
     "url": "",
-    "secret": ""
+    "secret": "",
+    "email": ""
   },
   "schedule": {
     "time": "",

@@ -14,6 +14,34 @@ prompt da rotina (`# lab-checkin roteiro <versão>`).
 
 ---
 
+## 2026-08-13 — `[worker]` `[cli]` `[setup]`
+
+**E-mail virou canal de verdade, sem depender do Telegram.** O `POST /notify`
+passou a aceitar `{ email, text }` direto no corpo (antes só resolvia o destino
+pelo `chatId` no KV — inútil justamente para quem não tem Telegram) e entrega
+por Resend. O domínio do destinatário é conferido contra `NOTIFY_EMAIL_DOMAINS`
+e recusado se não estiver na lista: o `NOTIFY_SECRET` é compartilhado no time e
+sem essa trava viraria relay aberto na conta Resend. Falha de entrega agora
+responde 502 — com 200 `{ok:false}` o `curl -sf` do `checkin.sh` lia sucesso e
+nunca caía no fallback do Telegram.
+
+No `config.json`: campo novo `notify.email`. Com `notify.url` + `notify.secret`
++ `notify.email`, o cron local também notifica por e-mail. **Admin**: setar
+`RESEND_API_KEY`, `NOTIFY_EMAIL_FROM` (domínio verificado na Resend) e
+`NOTIFY_EMAIL_DOMAINS`, e `wrangler deploy`.
+
+Motivo: com a migração do Google Workspace para a Microsoft, o conector Gmail
+não alcança a maioria das caixas do time — o worker alcança qualquer domínio.
+
+## 2026-08-13 — `[setup]`
+
+**Notificação deixou de ser "Telegram ou nada".** O setup agora pergunta o canal
+(Telegram / e-mail pelo conector Gmail / nenhum) em vez de funilar para o bot, e
+o bloco `Notificar` do prompt da rotina passou a existir sempre, com uma das três
+variantes. Quem escolher "nenhum" liga depois rodando `/setup-checkin` e pedindo
+notificação: só esse bloco é reescrito — credenciais, iniciativas e estilo ficam
+como estão. Rotina existente não precisa de nada.
+
 ## 2026-08-12 — `[rotina]` `[cli]` `[extensão]` `[worker]`
 
 **Envio confirmado, e o campo novo denunciado.** O Lab responde HTTP 302 tanto no

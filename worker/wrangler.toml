@@ -7,8 +7,27 @@ compatibility_date = "2026-07-01"
 #   WEBHOOK_SECRET — validado no header X-Telegram-Bot-Api-Secret-Token
 #   KV_ENC_KEY     — 32 bytes em base64 (openssl rand -base64 32); criptografa
 #                    as credenciais salvas em secrets:<chat_id> no KV
+#   NOTIFY_SECRET  — habilita o POST /notify
+#   RESEND_API_KEY — habilita a entrega por e-mail no /notify
 [vars]
 ADMIN_CHAT_ID = "140674932"
+# Remetente e dominios aceitos no { email } do /notify (dev sem Telegram).
+#
+# FROM: dominio dedicado da automacao, registrado no registro.br e verificado na
+# Resend (DKIM/SPF/DMARC em lab-checkin.com.br). Nao encosta no DNS do
+# solucoesindustriais.com.br, que esta migrando para a Microsoft, e nao depende
+# de quem administra o idealtrends.io. Contrapartida: reputacao comeca do zero —
+# nas primeiras semanas o M365 pode mandar para o lixo, entao avise o dev para
+# marcar "nao e spam" no primeiro aviso.
+#
+# DOMAINS e a lista de DESTINATARIOS aceitos, fail-closed: dominio fora dela
+# vira 403, para o NOTIFY_SECRET compartilhado nao virar relay aberto.
+# Acrescente aqui os dominios do time (Outlook/M365 inclusive).
+NOTIFY_EMAIL_FROM = "Auto Check-in <notify@lab-checkin.com.br>"
+# Enquanto o dominio nao verifica: troque pela linha abaixo para testar. O
+# remetente de teste da Resend so entrega no e-mail dono da conta Resend.
+# NOTIFY_EMAIL_FROM = "Auto Check-in <onboarding@resend.dev>"
+NOTIFY_EMAIL_DOMAINS = "solucoesindustriais.com.br,idealtrends.io"
 
 # Cron Trigger (Fase 6): tick a cada 15 min em horario comercial (UTC 11-21 =
 # 08-18 America/Sao_Paulo), seg-sex. O handler `scheduled` so age em usuarios

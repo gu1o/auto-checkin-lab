@@ -40,6 +40,10 @@ mudanças novas do repo, **não refaça o setup**:
 
 Se o dev pedir setup novo, ou não houver `config.json`, siga a partir da etapa 0.
 
+**Ligar notificação numa rotina já existente**: mesmo caminho — localize a
+rotina, escolha o canal (etapa 3) e reescreva **apenas** o bloco `Notificar`
+do prompt. Não refaça credenciais, iniciativas nem estilo.
+
 ## 0. Duas escolhas iniciais
 
 Pergunte as duas com `AskUserQuestion` (se a sessão começou com o aviso de
@@ -105,9 +109,24 @@ Leia o arquivo e confira:
 | `telegram.bot_token`, `telegram.chat_id` | Não | Perguntar se quer notificações (etapa 3); sem elas a rotina roda silenciosa |
 | `initiative_config` (mapa por iniciativa) | Não | Resolver iniciativas na etapa 4 |
 
-## 3. Telegram (opcional)
+## 3. Canal de notificação (opcional)
 
-Se o dev quiser notificações e o telegram estiver vazio:
+Pergunte com `AskUserQuestion` qual canal ele quer — **não assuma Telegram**:
+
+- **Telegram** (default se já tem conta) — ✅/❌/🚫 e os comandos remotos.
+- **E-mail** — a rotina manda o resumo para o e-mail dele (etapa 3.2). Sem
+  `/pular`, `/testar` nem `/config` (isso é só do bot).
+- **Nenhum por enquanto** — a rotina roda silenciosa; falha só aparece no
+  histórico de execuções da rotina no claude.ai. Diga isso explicitamente.
+
+Escolhendo "nenhum", avise que dá para ligar depois sem refazer nada: basta
+rodar `/setup-checkin` e pedir "quero notificação" — a skill acha a rotina
+existente (mesmo fluxo do modo atualização) e troca **só o bloco `Notificar`**
+do prompt, sem tocar em credenciais, iniciativas ou estilo.
+
+### 3.1 Telegram
+
+Se ele escolheu Telegram e o config estiver vazio:
 
 1. Mandar `/start` para o **@CheckInLabBot** e aguardar aprovação do admin
    (Guilherme).
@@ -120,11 +139,43 @@ credenciais salvas no `/config`) e `/config` (formulário seguro de
 credenciais na nuvem). Atalho: na extensão, o botão **🔗 Conectar Telegram**
 faz o registro por deep link e já preenche o `chat_id` sozinho (sem digitar).
 
-**Notificação por e-mail (alternativa ao Telegram):** na rotina cloud, o dev
-pode dispensar o Telegram e pedir para a rotina te avisar por **e-mail via o
-conector Gmail** dele — acrescente ao final do prompt da rotina um passo
-"envie um e-mail para {EMAIL} com o resumo do check-in" (o Claude Code usa o
-conector Gmail do próprio dev). Não distribua credencial SMTP.
+### 3.2 E-mail
+
+**Pergunte o e-mail de trabalho dele** (endereço completo — o domínio decide a
+rota, então não peça o domínio antes: ele já vem no endereço). Confirme o que
+leu de volta antes de gravar. Duas rotas, escolha pelo domínio:
+
+| Domínio | Rota | Por quê |
+|---|---|---|
+| Google Workspace / gmail.com | **Conector Gmail** da conta do dev, ou o worker | Ele já tem o conector; zero infra |
+| Outlook / M365 / qualquer outro | **Worker `/notify`** (Resend) | O conector Gmail não alcança caixa Microsoft |
+
+O time está migrando de Google Workspace para Microsoft — na dúvida, ou se o
+dev não souber dizer, use o **worker**: funciona para qualquer domínio e não
+quebra quando a conta Google dele for desativada.
+
+**Rota worker** (`notify.url` + `notify.secret` + `notify.email` no
+`config.json`; peça a URL e o secret ao admin se ele não tiver):
+
+1. Grave o endereço em `notify.email` do `config.json` — é o registro do canal,
+   e é dele que a rotina e o `checkin.sh` tiram o destinatário.
+2. Valide antes de seguir (o dev tem que receber o e-mail de teste):
+   ```bash
+   curl -sS -X POST "{NOTIFY_URL}/notify" -H 'content-type: application/json' \
+     -H "x-notify-secret: {NOTIFY_SECRET}" \
+     -d '{"email":"{EMAIL}","text":"teste do lab-checkin"}'
+   ```
+   `{"ok":true}` = entregue. **403 `dominio nao liberado`** = o domínio dele não
+   está em `NOTIFY_EMAIL_DOMAINS` no `wrangler.toml` do worker: peça ao admin
+   para acrescentar e redeployar (é fail-closed de propósito — o secret é
+   compartilhado no time e sem a lista viraria relay aberto). **502** = o admin
+   não configurou `RESEND_API_KEY`/`NOTIFY_EMAIL_FROM`.
+3. No modo nuvem, libere o host do worker na allowlist de egress (etapa 7.1).
+
+**Rota conector Gmail** (só modo nuvem): nada a configurar, o conector é da
+conta do dev — inclua `mcp__Gmail` e `ToolSearch` no `allowed_tools` da rotina.
+Avise do modo de falha: se o OAuth do conector cair, a notificação de falha é
+que falha, calada.
 
 ## 4. Validar credenciais e descobrir iniciativas
 
@@ -311,17 +362,28 @@ marcando os que nao existem no payload acima como campo novo do formulario.
 Diga que o check-in de hoje precisa ser preenchido na mao e que o campo novo
 tem que ser mapeado no script.
 
-Notificar [se Telegram]: sendMessage — ✅ com o resumo enviado (um por
-iniciativa) em sucesso; ❌ com a causa provável em falha (se for o cookie
-expirado, diga: "logue no Lab, exporte o config.json na extensão e rode
-/setup-checkin de novo").
+Notificar: ✅ com o resumo enviado (um por iniciativa) em sucesso; ❌ com a
+causa provável em falha (se for o cookie expirado, diga: "logue no Lab,
+exporte o config.json na extensão e rode /setup-checkin de novo").
+[Telegram: via sendMessage no chat {CHAT_ID}]
+[E-mail pelo worker: POST {NOTIFY_URL}/notify com header
+x-notify-secret: {NOTIFY_SECRET} e body {"email": "{EMAIL}", "text": "<a
+mensagem>"} — 2xx é entregue; qualquer outro status, registre o corpo da
+resposta no log da execução (403 = domínio fora da allowlist do worker)]
+[E-mail pelo conector Gmail: envie para {EMAIL}, assunto "Check-in {DATA}"]
+[Sem canal: não notifique — mas em falha, encerre a execução com erro para
+ficar registrado no histórico da rotina]
 ```
+
+Deixe este bloco sempre presente no prompt, com uma das três variantes — é o
+único trecho que muda quando o dev resolver ligar notificação depois.
 
 ## 7. Pós-setup (passos manuais do dev — itens 1 e 2 só no modo nuvem)
 
 1. **Allowlist de egress** do environment da rotina (só pela UI do claude.ai:
    ícone do environment → engrenagem): liberar `lab.idealtrends.io`,
-   `api.telegram.org`, `*.atlassian.net` e `api.bitbucket.org`. No modo A,
+   `api.telegram.org`, `*.atlassian.net` e `api.bitbucket.org` — mais o host do
+   worker se o canal for e-mail pelo `/notify`. No modo A,
    no modo MCP, `*.atlassian.net` só é necessário se algo ainda chamar a API do
    Jira direto — e confira na UI da rotina que os conectores Atlassian e Ideal
    Lab estão habilitados para ela (conector desabilitado = rotina sem o Jira).
