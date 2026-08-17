@@ -295,6 +295,19 @@ de tokens. Se a tool não aparecer pelo nome curto, é falso negativo — use o
 nome completo; e se o Jira falhar mesmo assim, siga só com o Bitbucket em vez
 de abortar." e mantenha Bitbucket/cookie/Telegram como acima]
 
+Regra de shell (obrigatória — esta rotina roda sozinha, sem ninguém para
+aprovar nada): nunca use `&` para rodar comando em segundo plano e nunca deixe
+aspa desbalanceada. O sandbox exige aprovação humana para qualquer comando em
+que o `&` possa ser operador de background — e o `&` de query string entra
+nessa conta quando as aspas não fecham; sem ninguém para aprovar, o comando
+fica ~1 min preso e morre com "unexpected EOF". Uma chamada Bash = um comando
+curto: uma chamada por repositório, sem loop `for` de várias linhas juntando
+tudo. Toda URL entre aspas simples ('https://...?pagelen=20&fields=x,y'). Para
+mandar JSON de arquivo no curl use `--data @arquivo` (o `-d`/`--data` lê o
+arquivo); `--data-raw "@arquivo"` envia o literal `@arquivo` como corpo. No
+relatório final, diga se algum comando ficou preso em pedido de aprovação,
+citando o comando.
+
 ⚠️ `allowed_tools` da rotina **precisa incluir `ToolSearch`** além de
 `mcp__<connector>` — sem ela o agente não consegue carregar o schema de
 nenhuma tool de conector e reporta "tool não existe".
@@ -350,7 +363,8 @@ um GET (o Set-Cookie devolve XSRF-TOKEN), mande o XSRF url-decodificado no
 header x-xsrf-token, headers x-inertia: true e x-requested-with:
 XMLHttpRequest. Body JSON: initiative_id, checkin_date (hoje, YYYY-MM-DD),
 yesterday_text, today_text, confidence_score: 5, blockers_text: "",
-yesterday_artifact_url: "".
+yesterday_artifact_url: "". Se escrever o body num arquivo, mande com
+`--data @arquivo` (sem aspas em volta do @) — ver a regra de shell acima.
 
 Confirmar: o 302 NAO prova nada — o Inertia responde 302 tambem quando a
 validacao reprova (volta para a pagina com os erros na sessao). Depois do POST,
@@ -360,7 +374,10 @@ MESMO GET (e onde o Inertia entrega o bag de validacao; pode vir aninhado em
 props.errors.default) e notifique ❌ citando cada campo e a mensagem dele,
 marcando os que nao existem no payload acima como campo novo do formulario.
 Diga que o check-in de hoje precisa ser preenchido na mao e que o campo novo
-tem que ser mapeado no script.
+tem que ser mapeado no script. Excecao: se TODOS os campos do proprio payload
+voltarem como obrigatorio, o corpo nao chegou ao servidor (erro de transmissao
+do curl) — nao e campo novo; conserte a chamada e reenvie UMA vez, confirmando
+de novo.
 
 Notificar: ✅ com o resumo enviado (um por iniciativa) em sucesso; ❌ com a
 causa provável em falha (se for o cookie expirado, diga: "logue no Lab,

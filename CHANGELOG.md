@@ -14,6 +14,28 @@ prompt da rotina (`# lab-checkin roteiro <versão>`).
 
 ---
 
+## 2026-08-17 — `[rotina]`
+
+**A rotina parou de pedir aprovação para rodar os próprios passos.** O sandbox
+do claude.ai exige aprovação humana para todo comando em que o `&` possa ser
+operador de background — e isso inclui o `&` de query string quando alguma aspa
+não fecha. Como a rotina roda sozinha, cada comando desses ficava ~1 min preso
+e morria com `unexpected EOF`. Não é ajuste de `allowed_tools`: a checagem roda
+por análise do comando, `Bash` liberado não a dispensa. O roteiro agora traz uma
+**regra de shell** — sem `&` de background, uma chamada Bash por repositório
+(nada de loop `for` multi-linha), URL sempre entre aspas simples — e a execução
+tem que relatar se algum comando ficou preso em aprovação.
+
+Na mesma linha: o envio passou a usar `--data @arquivo` em vez de
+`--data-raw "@arquivo"`, que mandava o literal `@arquivo` como corpo e fazia o
+Lab reprovar **todos** os campos como obrigatórios. Junto veio a exceção no
+passo de confirmação: payload inteiro reprovado por "obrigatório" é falha de
+transmissão, não campo novo do formulário — conserta e reenvia uma vez, em vez
+de desistir e mandar ❌.
+
+Quem usa rotina: atualize (`/setup-checkin` ou "atualize minha rotina"). Cron
+local e extensão não são afetados — não há camada de permissão no caminho deles.
+
 ## 2026-08-13 — `[worker]` `[cli]` `[setup]`
 
 **E-mail virou canal de verdade, sem depender do Telegram.** O `POST /notify`
