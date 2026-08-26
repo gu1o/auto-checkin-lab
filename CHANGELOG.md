@@ -14,6 +14,67 @@ prompt da rotina (`# lab-checkin roteiro <versão>`).
 
 ---
 
+## 2026-08-26 — `[worker]` `[cli]`
+
+**O `/pular` ganhou calendário — como Mini App.** "Outra data" abria um
+`ForceReply` pedindo a data digitada. Agora a mensagem do `/pular` traz um botão
+`web_app` que abre uma **página nossa** (rota `/picker` do Worker) com o
+[Air Datepicker](https://air-datepicker.com) (MIT) em `multipleDates`: seleção
+real, célula desabilitada de verdade, mês em pt-BR e as cores do tema do
+Telegram. Nada disso um `inline_keyboard` entrega — a primeira versão do dia,
+desenhada com botões (`✓26`, dia bloqueado em subscrito, `✔ Confirmar (N)`),
+foi substituída por esta.
+
+A ideia veio do [TGDates](https://github.com/harshil21/TGDates), mas **não a
+dependência**: o endpoint público dele morreu junto com os `*.repl.co`, o código
+é GPL-3.0 (contaminaria o Worker) e o `host.py`+webpack não serve para nada aqui
+— o Worker já serve HTTP (`/setup`, `/notify`, `/devlink`).
+
+**Entrada e retorno.** Botão inline `web_app`, não `KeyboardButton`: mantém o
+fluxo na própria mensagem em vez de trocar o teclado da pessoa. Em troca não há
+`sendData()` (só existe em `KeyboardButton`), então o retorno é um **POST na
+própria rota**, autenticado pelo `initData` — HMAC-SHA256 do bot token, receita
+da doc, ~20 linhas de WebCrypto — que é também de onde sai o `chat_id`. Sem essa
+validação a rota seria um `/pular` aberto para qualquer um.
+
+O calendário **já abre marcando o que está agendado**; desmarcar um dia agendado
+o retoma. A seleção é o estado final: `writeSkips` uma vez e relato do diff, em
+vez de encadear `doPular` + `doRetomar`. Passado e fim de semana ficam
+`disabled` (`minDate` + `onRenderCell`), e o `minDate` vem do **servidor** (fuso
+de São Paulo), não do relógio do aparelho. As datas voltam como `YYYY-MM-DD`
+montado das partes locais — `Date.toISOString()` converteria para UTC e em fuso
+positivo devolveria o dia anterior (é o bug que o TGDates tem).
+
+**O `/retomar` abriu o mesmo calendário.** `/retomar` sem data listava os
+agendados e mandava você digitar; agora traz o mesmo botão, com `?m=retomar`:
+só os dias agendados são clicáveis, e cada toque é um dia que volta a rodar.
+
+**Cada modo anda para um lado só.** O `/pular` soma, o `/retomar` subtrai — a
+primeira versão fazia as duas coisas no mesmo calendário (desmarcar um agendado
+o retomava) e não dava para saber se desmarcar era "não quero mais pular" ou
+"nunca quis". Os dois abrem sem nada marcado; no `/pular` o agendado aparece
+mas vem `disabled` (informa, não se mexe).
+
+**Legenda e duas cores.** O calendário e a legenda ficam no mesmo cartão.
+Laranja é o que já está agendado, a cor do botão do tema é o que está sendo
+escolhido agora — vale nos dois modos, com a legenda trocando os rótulos
+(`Já agendado` / `Escolhido agora` no `/pular`, `Agendado` / `Volta a rodar` no
+`/retomar`). Duas regras de CSS sobre o `-selected-` que a própria lib liga e
+desliga, então não dependem de re-render; a classe `agendado` sai do
+`onRenderCell` a partir do conjunto que veio do servidor.
+
+Air Datepicker vem do **jsdelivr** (49KB+20KB), não vendorizado. Custo conhecido:
+Mini App exige cliente oficial recente e o CDN precisa estar de pé — nos dois
+casos a saída é `DD/MM` digitado (ou o período `DD/MM-DD/MM`), que continua
+valendo e é o que os testes cobrem.
+
+O `telegram_poller.py` (alternativa local, desativada enquanto o webhook está
+ativo) fica com o calendário de botões do `inline_calendar.py`: sem servir HTTP
+não há Mini App para abrir.
+
+Admin: `wrangler deploy`. Checagem: `node worker/test_pular.mjs` e
+`python3 inline_calendar.py`.
+
 ## 2026-08-17 — `[rotina]`
 
 **A rotina parou de pedir aprovação para rodar os próprios passos.** O sandbox

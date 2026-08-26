@@ -40,7 +40,9 @@
 
 const SP_TZ = 'America/Sao_Paulo';
 const SKIP_MARKER = 'SKIP:';
-const ASK_TEXT = 'Qual data? Responda esta mensagem com DD/MM';
+const ASK_TEXT =
+  'Pular o check-in de quando?\n' +
+  'Abra o calendario ou digite DD/MM (ou um periodo: DD/MM-DD/MM).';
 const ASK_INITIATIVE = 'Qual a iniciativa padrao? Responda esta mensagem com o ID numerico (ex: 6)';
 const ASK_TIME = 'Qual horario do check-in automatico? Responda esta mensagem com HH:MM (ex: 09:30)';
 const SETUP_TTL_S = 600; // 10 minutos
@@ -48,9 +50,10 @@ const REPOS_PAGE = 12; // repos por pagina no teclado do /repos
 const WD_PT = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'];
 const HELP =
   'Comandos:\n' +
-  '/pular — cancela o check-in automatico de um dia (pergunto a data)\n' +
+  '/pular — cancela o check-in automatico (abre o calendario)\n' +
   '/pular DD/MM — cancela direto para a data\n' +
-  '/retomar DD/MM — desfaz um cancelamento\n' +
+  '/pular DD/MM-DD/MM — cancela um periodo inteiro (so os dias uteis)\n' +
+  '/retomar — desfaz cancelamentos (abre o calendario)\n' +
   '/pulos — lista os cancelamentos agendados\n' +
   '/painel — resumo da sua configuracao do check-in automatico\n' +
   '/repos — ver e ajustar os repositorios no escopo da coleta\n' +
@@ -78,6 +81,17 @@ export default {
 
     // /notify (Fase 5b) e /devlink (Fase 1C): chamadas dos runners/extensao,
     // nao do Telegram. Autenticacao propria (segredo / bot token), com CORS.
+    // Mini App do /pular: GET serve a pagina, POST recebe a selecao. Autentica
+    // pelo initData (HMAC do bot token), nao pelo header do webhook.
+    if (url.pathname === '/picker') {
+      try {
+        return await handlePicker(request, url, env);
+      } catch (e) {
+        console.error('erro no /picker', e);
+        return jsonCors({ ok: false, error: 'internal' }, 500);
+      }
+    }
+
     if (url.pathname === '/notify') {
       try {
         return await handleNotify(request, env);
@@ -209,6 +223,23 @@ function parseDate(raw) {
   return iso;
 }
 
+/** Data unica ou periodo ("21/07-25/07", "21/07 a 25/07"). Retorna [] se invalido. */
+function parseDates(raw) {
+  const one = parseDate(raw);
+  if (one) return [one];
+  const m = raw.trim().toLowerCase().match(/^(.+?)\s*(?:at[eé]|a|-|–|\.\.)\s*(.+)$/);
+  if (!m) return [];
+  const from = parseDate(m[1]);
+  const to = parseDate(m[2]);
+  if (!from || !to || to < from) return [];
+  const out = [];
+  for (let d = from; d <= to; d = addDays(d, 1)) {
+    if (out.length > 90) return []; // periodo absurdo: trata como nao entendido
+    out.push(d);
+  }
+  return out;
+}
+
 // --- mensagem fixada com as datas de skip (sempre no chat de origem) ----------
 
 async function getSkips(env, chatId) {
@@ -248,54 +279,65 @@ async function writeSkips(env, chatId, pm, dates) {
 
 // --- comandos de skip ----------------------------------------------------------
 
-async function doPular(env, chatId, iso) {
-  if (!iso) {
-    await send(env, chatId, 'Nao entendi a data. Manda DD/MM (ex: 21/07), "hoje" ou "amanha".');
+async function doPular(env, chatId, isos) {
+  if (!isos || !isos.length) {
+    await send(env, chatId, 'Nao entendi a data. Manda DD/MM (ex: 21/07), um periodo (ex: 21/07-25/07), "hoje" ou "amanha".');
     return;
   }
-  if (iso < todayIso()) {
-    await send(env, chatId, `${fmt(iso)} ja passou — nada a cancelar.`);
-    return;
-  }
-  if (weekday(iso) === 0 || weekday(iso) === 6) {
-    await send(env, chatId, `${fmt(iso)} e fim de semana — o check-in nem roda nesse dia, nada a cancelar.`);
+  const today = todayIso();
+  const uteis = isos.filter((iso) => iso >= today && weekday(iso) !== 0 && weekday(iso) !== 6);
+  if (!uteis.length) {
+    if (isos.length > 1) await send(env, chatId, 'Nenhum dia util no periodo — nada a cancelar.');
+    else if (isos[0] < today) await send(env, chatId, `${fmt(isos[0])} ja passou — nada a cancelar.`);
+    else await send(env, chatId, `${fmt(isos[0])} e fim de semana — o check-in nem roda nesse dia, nada a cancelar.`);
     return;
   }
   const { pm, dates } = await getSkips(env, chatId);
-  if (dates.includes(iso)) {
-    await send(env, chatId, `O check-in de ${fmt(iso)} ja estava cancelado.`);
+  const novos = uteis.filter((iso) => !dates.includes(iso));
+  if (!novos.length) {
+    await send(env, chatId, uteis.length === 1
+      ? `O check-in de ${fmt(uteis[0])} ja estava cancelado.`
+      : 'Todos os dias uteis desse periodo ja estavam cancelados.');
     return;
   }
-  await writeSkips(env, chatId, pm, [...dates, iso]);
-  const [, m, d] = iso.split('-');
-  await send(env, chatId, `🚫 Fechado! Vou pular o check-in de ${fmt(iso)}. Pra desfazer: /retomar ${d}/${m}`);
+  await writeSkips(env, chatId, pm, [...dates, ...novos]);
+  const [, m, d] = novos[0].split('-');
+  await send(env, chatId, novos.length === 1
+    ? `🚫 Fechado! Vou pular o check-in de ${fmt(novos[0])}. Pra desfazer: /retomar ${d}/${m}`
+    : `🚫 Fechado! Vou pular ${novos.length} check-ins: ${novos.map(fmt).join(', ')}.\nPra desfazer: /retomar ${d}/${m}-${novos[novos.length - 1].split('-')[2]}/${novos[novos.length - 1].split('-')[1]}`);
 }
 
-async function doRetomar(env, chatId, arg) {
+async function doRetomar(env, chatId, arg, origin) {
   const { pm, dates } = await getSkips(env, chatId);
   if (!dates.length) {
     await send(env, chatId, 'Nao ha nenhum cancelamento agendado.');
     return;
   }
-  let iso;
+  let alvo;
   if (arg) {
-    iso = parseDate(arg);
-    if (!iso) {
-      await send(env, chatId, 'Nao entendi a data. Ex: /retomar 21/07');
+    alvo = parseDates(arg);
+    if (!alvo.length) {
+      await send(env, chatId, 'Nao entendi a data. Ex: /retomar 21/07 (ou um periodo: 21/07-25/07)');
       return;
     }
-  } else if (dates.length === 1) {
-    iso = dates[0];
   } else {
-    await send(env, chatId, 'Ha mais de um cancelamento agendado: ' + dates.map(fmt).join(', ') + '. Especifique: /retomar DD/MM');
+    // Sem data: o calendario mostra so o que esta agendado, e cada toque e um
+    // dia que volta a rodar.
+    await send(env, chatId, 'Agendados: ' + dates.map(fmt).join(', ') +
+      '\n\nEscolha no calendario ou digite: /retomar DD/MM (ou DD/MM-DD/MM).', {
+      inline_keyboard: [[{ text: '📅 Escolher no calendario', web_app: { url: `${origin}/picker?m=retomar` } }]],
+    });
     return;
   }
-  if (!dates.includes(iso)) {
-    await send(env, chatId, `${fmt(iso)} nao estava cancelado. Agendados: ` + dates.map(fmt).join(', '));
+  const remover = alvo.filter((iso) => dates.includes(iso));
+  if (!remover.length) {
+    await send(env, chatId, (alvo.length === 1 ? `${fmt(alvo[0])} nao estava cancelado.` : 'Nenhuma data desse periodo estava cancelada.') + ' Agendados: ' + dates.map(fmt).join(', '));
     return;
   }
-  await writeSkips(env, chatId, pm, dates.filter((d) => d !== iso));
-  await send(env, chatId, `✅ Cancelamento desfeito — o check-in de ${fmt(iso)} volta a ser enviado normalmente.`);
+  await writeSkips(env, chatId, pm, dates.filter((iso) => !remover.includes(iso)));
+  await send(env, chatId, remover.length === 1
+    ? `✅ Cancelamento desfeito — o check-in de ${fmt(remover[0])} volta a ser enviado normalmente.`
+    : `✅ ${remover.length} cancelamentos desfeitos (${remover.map(fmt).join(', ')}) — os check-ins voltam a ser enviados normalmente.`);
 }
 
 async function doPulos(env, chatId) {
@@ -306,14 +348,218 @@ async function doPulos(env, chatId) {
   else await send(env, chatId, 'Check-ins cancelados: ' + future.map(fmt).join(', '));
 }
 
-function askDate(env, chatId) {
-  return send(env, chatId, 'Pular o check-in de quando?', {
+/** Marca/limpa "estou esperando uma data" — o ForceReply sozinho nao basta:
+ *  se o dev digita a data como mensagem nova, o reply_to_message nao vem. */
+async function setPendingPular(env, chatId, user, on = true) {
+  if (!user) return;
+  user.prefs = user.prefs || {};
+  if (on) user.prefs._pending = 'pular';
+  else if (user.prefs._pending === 'pular') delete user.prefs._pending;
+  else return;
+  await putUser(env, chatId, user);
+}
+
+// --- calendario: Mini App com Air Datepicker -------------------------------------
+// O teclado inline de botoes foi trocado por um Mini App (webview): uma pagina
+// nossa numa rota do Worker, com o Air Datepicker (MIT) em `multipleDates`.
+// Selecao real, celula desabilitada de verdade, mes em pt-BR e cores do tema do
+// Telegram — nada disso um inline_keyboard entrega.
+//
+// Entrada: botao `web_app` na mensagem do /pular (nao `KeyboardButton`, que
+// trocaria o teclado do usuario). Como `sendData()` so existe em KeyboardButton,
+// o retorno vem por POST na propria rota, autenticado pelo `initData` (HMAC do
+// bot token) — que tambem e de onde sai o chat_id.
+//
+// Cliente antigo ou de terceiro nao abre Mini App: `/pular DD/MM` (e o periodo
+// DD/MM-DD/MM) continua sendo a saida, e e o que os testes cobrem.
+
+// ponytail: Air Datepicker vem do jsdelivr, nao vendorizado (seriam ~70KB no
+// repo + regra Text no wrangler.toml + uma nota de como atualizar). Se o CDN
+// virar problema, vendorize — o resto da pagina nao muda.
+const ADP = 'https://cdn.jsdelivr.net/npm/air-datepicker@3.6.0/air-datepicker';
+
+/** Dia em que o check-in nao roda — logo, nao ha o que pular. */
+function calBlocked(iso) {
+  if (iso < todayIso()) return 'ja passou';
+  const wd = weekday(iso);
+  return wd === 0 || wd === 6 ? 'e fim de semana — o check-in nao roda' : '';
+}
+
+/** A selecao E o estado final desejado: grava uma vez e conta o diff.
+ *  Uma escrita so — doPular + doRetomar em sequencia dariam dois writeSkips. */
+async function calConfirm(env, chatId, sel) {
+  const { pm, dates } = await getSkips(env, chatId);
+  const atuais = dates.filter((d) => !calBlocked(d));
+  const add = sel.filter((d) => !atuais.includes(d));
+  const rem = atuais.filter((d) => !sel.includes(d));
+  if (!add.length && !rem.length) {
+    await send(env, chatId, 'Nada mudou — a lista de pulos continua a mesma.');
+    return;
+  }
+  await writeSkips(env, chatId, pm, sel);
+  const partes = [];
+  if (add.length) partes.push(`🚫 Vou pular: ${add.map(fmt).join(', ')}`);
+  if (rem.length) partes.push(`✅ Volta a rodar: ${rem.map(fmt).join(', ')}`);
+  await send(env, chatId, partes.join('\n') + '\n\nPra mexer de novo: /pular');
+}
+
+async function hmacSha256(key, msg) {
+  const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg)));
+}
+
+/** Valida o initData do Mini App (receita da doc do Telegram) e devolve o
+ *  chat_id. Sem isso a rota seria um /pular aberto para qualquer um. */
+async function initDataChatId(env, initData) {
+  const p = new URLSearchParams(initData || '');
+  const hash = p.get('hash');
+  if (!hash) return null;
+  p.delete('hash');
+  const check = [...p].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join('\n');
+  const secret = await hmacSha256(new TextEncoder().encode('WebAppData'), env.BOT_TOKEN);
+  const sig = [...(await hmacSha256(secret, check))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  if (sig !== hash) return null;
+  if (Date.now() / 1000 - Number(p.get('auth_date') || 0) > 86400) return null; // initData velho
+  try {
+    return JSON.parse(p.get('user')).id;
+  } catch {
+    return null;
+  }
+}
+
+/** GET: a pagina (`?m=retomar` abre o modo retomar). POST sem `dates`: o estado
+ *  atual. POST com `dates`: aplica.
+ *
+ *  Cada modo so anda para um lado — pular soma, retomar subtrai. Um calendario
+ *  que fizesse as duas coisas de uma vez ja existiu aqui e confundia: nao dava
+ *  para saber se desmarcar era "nao quero mais pular" ou "nunca quis". */
+async function handlePicker(request, url, env) {
+  if (request.method !== 'POST') return pickerPage(url.searchParams.get('m') === 'retomar');
+  const body = await request.json().catch(() => ({}));
+  const chatId = await initDataChatId(env, body.initData);
+  if (!chatId) return jsonCors({ ok: false, error: 'sessao invalida — reabra pelo bot' }, 403);
+  const { dates } = await getSkips(env, chatId);
+  const agendados = dates.filter((d) => !calBlocked(d));
+  if (!Array.isArray(body.dates)) return jsonCors({ ok: true, today: todayIso(), dates: agendados });
+  const sel = body.dates.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && !calBlocked(d));
+  const retomar = body.mode === 'retomar';
+  const final = retomar
+    ? agendados.filter((d) => !sel.includes(d))
+    : [...new Set([...agendados, ...sel])].sort();
+  await calConfirm(env, chatId, final);
+  return jsonCors({ ok: true });
+}
+
+function pickerPage(retomar) {
+  const t = retomar
+    ? { titulo: 'Retomar check-in', instr: 'Toque nos dias agendados que devem voltar a rodar.',
+        botao: 'Retomar', leg: [['agendado', 'Agendado'], ['novo', 'Volta a rodar']] }
+    : { titulo: 'Pular check-in', instr: 'Toque nos dias em que o check-in NAO deve rodar.',
+        botao: 'Confirmar', leg: [['novo', 'Escolhido agora'], ['agendado', 'Ja agendado']] };
+  return new Response(
+    `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>${t.titulo}</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="${ADP}.css">
+<style>
+ body{margin:0;padding:14px;font:16px/1.45 system-ui,sans-serif;
+      background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#222)}
+ p{margin:0 0 12px;font-size:.85rem;color:var(--tg-theme-hint-color,#777)}
+ #erro{color:#d33}
+ /* Cor do "ja agendado": laranja fixo, legivel nos dois temas. O azul (ou o que
+    a pessoa tiver de button_color) fica para o que ela esta escolhendo agora. */
+ :root{--cor-agendado:#e08a1e}
+ /* O quadro: calendario e legenda no mesmo cartao. */
+ #quadro{border:1px solid var(--tg-theme-hint-color,#ccc);border-radius:12px;padding:8px 8px 4px;
+         background:var(--tg-theme-secondary-bg-color,transparent)}
+ .legenda{display:flex;flex-wrap:wrap;gap:4px 16px;margin:2px 0 0;padding:8px 6px 6px;list-style:none;
+          border-top:1px solid var(--tg-theme-hint-color,#ddd);font-size:.78rem}
+ .legenda li{display:flex;align-items:center;gap:6px}
+ .legenda i{width:14px;height:14px;border-radius:4px;flex:0 0 auto}
+ .legenda .novo{background:var(--tg-theme-button-color,#2563eb)}
+ .legenda .agendado{background:var(--cor-agendado)}
+ /* Laranja = ja agendado; cor do tema = o que esta sendo escolhido agora. Serve
+    aos dois modos: no /pular o agendado vem desabilitado (so informa), no
+    /retomar e ele que se seleciona. Puro CSS sobre o -selected- que a lib mesma
+    liga e desliga, entao nao depende de re-render. */
+ .air-datepicker-cell.-day-.agendado{background:var(--cor-agendado);color:#fff}
+ .air-datepicker-cell.-day-.agendado.-selected-{background:var(--tg-theme-button-color,#2563eb)}
+ .air-datepicker{border:0;box-shadow:none;--adp-width:100%;
+   --adp-background-color:transparent;--adp-color:inherit;--adp-border-color-inner:transparent;
+   --adp-accent-color:var(--tg-theme-button-color,#2563eb);
+   --adp-cell-background-color-selected:var(--tg-theme-button-color,#2563eb);
+   --adp-cell-background-color-selected-hover:var(--tg-theme-button-color,#2563eb);
+   --adp-color-secondary:var(--tg-theme-hint-color,#999);
+   --adp-day-name-color:var(--tg-theme-hint-color,#777);
+   --adp-color-disabled:var(--tg-theme-hint-color,#bbb)}
+</style></head><body>
+<p>${t.instr}</p>
+<div id="quadro"><div id="cal"></div><ul class="legenda" id="legenda">
+${t.leg.map(([c, txt]) => ` <li><i class="${c}"></i>${txt}</li>`).join('\n')}
+</ul></div><p id="erro"></p>
+<script src="${ADP}.js"></script>
+<script>
+var tg = Telegram.WebApp; tg.ready(); tg.expand();
+var erro = document.getElementById('erro');
+var MODO = '${retomar ? 'retomar' : 'pular'}', RETOMAR = MODO === 'retomar';
+// AAAA-MM-DD das partes LOCAIS: Date.toISOString() converte para UTC e em fuso
+// positivo devolveria o dia anterior.
+function iso(d){ return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+var PT = {days:['Domingo','Segunda','Terca','Quarta','Quinta','Sexta','Sabado'],
+ daysShort:['Dom','Seg','Ter','Qua','Qui','Sex','Sab'],
+ daysMin:['Dom','Seg','Ter','Qua','Qui','Sex','Sab'],
+ months:['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'],
+ monthsShort:['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'],
+ today:'Hoje', clear:'Limpar', dateFormat:'dd/MM/yyyy', timeFormat:'HH:mm', firstDay:0};
+
+function post(body){
+  body.initData = tg.initData;
+  return fetch('/picker',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){ return r.json(); })
+    .then(function(r){ if(!r.ok) throw new Error(r.error || 'falhou'); return r; });
+}
+
+post({}).then(function(r){
+  function rotulo(n){ tg.MainButton.setText('${t.botao} (' + n + ')').show(); }
+  // Cada modo abre com nada marcado e so anda para um lado: no /pular o agendado
+  // fica desabilitado (informa, nao se mexe); no /retomar so ele e clicavel.
+  var dp = new AirDatepicker('#cal', {
+    inline:true, locale:PT, multipleDates:true, firstDay:0,
+    // minDate vem do servidor (fuso de Sao Paulo), nao do relogio do aparelho.
+    minDate:new Date(r.today + 'T00:00:00'),
+    onRenderCell:function(o){
+      if (o.cellType !== 'day') return {};
+      var wd = o.date.getDay();
+      if (wd === 0 || wd === 6) return {disabled:true};
+      var agendado = r.dates.indexOf(iso(o.date)) >= 0;
+      if (agendado) return {classes:'agendado', disabled:RETOMAR ? false : true};
+      return RETOMAR ? {disabled:true} : {};
+    },
+    onSelect:function(o){ rotulo(o.datepicker.selectedDates.length); },
+  });
+  rotulo(0);
+  tg.MainButton.onClick(function(){
+    tg.MainButton.showProgress();
+    post({mode:MODO, dates: dp.selectedDates.map(iso)})
+      .then(function(){ tg.close(); })
+      .catch(function(e){ tg.MainButton.hideProgress(); erro.textContent = e.message; });
+  });
+}).catch(function(e){ erro.textContent = 'Nao deu para abrir o calendario: ' + e.message; });
+</script></body></html>`,
+    { headers: { 'content-type': 'text/html; charset=utf-8' } }
+  );
+}
+
+async function askDate(env, chatId, user, origin) {
+  await setPendingPular(env, chatId, user);
+  return send(env, chatId, ASK_TEXT, {
     inline_keyboard: [
       [
         { text: 'Hoje', callback_data: 'pular:hoje' },
         { text: 'Amanha', callback_data: 'pular:amanha' },
-        { text: 'Outra data', callback_data: 'pular:outra' },
       ],
+      [{ text: '📅 Escolher no calendario', web_app: { url: `${origin}/picker` } }],
     ],
   });
 }
@@ -1893,7 +2139,7 @@ async function runnerCron(env) {
 }
 
 // exporta para uso futuro / test_draft.mjs
-export { decryptJson, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail, emailAllowed };
+export { decryptJson, parseDates, calBlocked, initDataChatId, pickerPage, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail, emailAllowed };
 
 // --- roteamento -----------------------------------------------------------------
 
@@ -1934,8 +2180,8 @@ async function handle(update, env, origin) {
       return;
     }
     if (cmd === 'pular') {
-      if (arg === 'outra') await send(env, chatId, ASK_TEXT, { force_reply: true });
-      else await doPular(env, chatId, parseDate(arg));
+      await setPendingPular(env, chatId, user, false);
+      await doPular(env, chatId, parseDates(arg));
     }
     return;
   }
@@ -1963,10 +2209,14 @@ async function handle(update, env, origin) {
 
   if (low.startsWith('/pular')) {
     const arg = text.slice('/pular'.length).trim();
-    if (arg) await doPular(env, chatId, parseDate(arg));
-    else await askDate(env, chatId);
+    if (arg) {
+      await setPendingPular(env, chatId, user, false);
+      await doPular(env, chatId, parseDates(arg));
+    } else {
+      await askDate(env, chatId, user, origin);
+    }
   } else if (low.startsWith('/retomar')) {
-    await doRetomar(env, chatId, text.slice('/retomar'.length).trim());
+    await doRetomar(env, chatId, text.slice('/retomar'.length).trim(), origin);
   } else if (low.startsWith('/pulos')) {
     await doPulos(env, chatId);
   } else if (low.startsWith('/painel')) {
@@ -1986,11 +2236,14 @@ async function handle(update, env, origin) {
   } else if (low.startsWith('/testar')) {
     await doTestar(env, chatId);
   } else if (low.startsWith('/cancelar')) {
+    await setPendingPular(env, chatId, user, false);
     await send(env, chatId, 'Ok, deixa pra la.');
   } else if (msg.reply_to_message?.text?.startsWith('O que ajustar?')) {
     await regenDraft(env, chatId, text); // contexto do "✏️ Refazer"
-  } else if (msg.reply_to_message?.text?.startsWith('Qual data?')) {
-    await doPular(env, chatId, parseDate(text)); // resposta ao ForceReply de "Outra data"
+  } else if (user.prefs?._pending === 'pular') {
+    // data digitada logo apos o /pular, com ou sem reply
+    await setPendingPular(env, chatId, user, false);
+    await doPular(env, chatId, parseDates(text));
   } else if (msg.reply_to_message && (await handlePrefReply(env, chatId, user, msg))) {
     // resposta a uma pergunta de preferencia — ja tratada
   } else {

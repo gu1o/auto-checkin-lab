@@ -29,6 +29,8 @@ import urllib.parse
 import urllib.request
 import zoneinfo
 
+import inline_calendar
+
 DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(DIR, "config.json")
 CHECKIN_PATH = os.path.join(DIR, "checkin.sh")
@@ -300,12 +302,15 @@ def ask_date():
     global pending
     pending = "pular"
     send("Pular o check-in de quando?", reply_markup={
-        "inline_keyboard": [[
-            {"text": "Hoje", "callback_data": "pular:hoje"},
-            {"text": "Amanha", "callback_data": "pular:amanha"},
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "Hoje", "callback_data": "pular:hoje"},
+                {"text": "Amanha", "callback_data": "pular:amanha"},
+            ],
+            [{"text": "Escolher no calendario", "callback_data": "pular:calendario"}],
+        ]
     })
-    # sem botao para outra data: e so responder com DD/MM
+    # ou responder com a data em texto: DD/MM
 
 
 def handle_text(text):
@@ -357,14 +362,98 @@ def handle_text(text):
         send(HELP)
 
 
+def set_markup(message_id, markup=None):
+    """Troca (ou remove, com markup=None) os botoes de uma mensagem ja enviada."""
+    params = {"chat_id": CHAT_ID, "message_id": message_id}
+    if markup:
+        params["reply_markup"] = json.dumps(markup)
+    api("editMessageReplyMarkup", params)
+
+
+CAL_TEXT = ("Toque nos dias em que o check-in NAO deve rodar e confirme.\n"
+            "Os que ja estao agendados vem marcados — desmarcar retoma o dia.\n"
+            "Ou responda com DD/MM.")
+
+
+def cal_blocked(d):
+    """Dia em que o check-in nao roda — logo, nao ha o que pular."""
+    if d < today():
+        return "ja passou"
+    return "e fim de semana — o check-in nao roda" if d.weekday() >= 5 else ""
+
+
+def show_calendar(message_id, month, sel=()):
+    """Redesenha o calendario (texto + teclado) no lugar; a selecao vai no texto."""
+    api("editMessageText", {
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+        "text": inline_calendar.text(CAL_TEXT, sel),
+        "reply_markup": json.dumps({"inline_keyboard": inline_calendar.keyboard(
+            month, start=today(), enabled=lambda d: d.weekday() < 5, sel=sel)}),
+    })
+
+
+def open_calendar(message_id):
+    """Abre ja marcando o que esta agendado."""
+    _, dates = get_skips()
+    sel = [d for d in (datetime.date.fromisoformat(x) for x in dates) if not cal_blocked(d)]
+    show_calendar(message_id, today(), sel)
+
+
+def cal_confirm(sel):
+    """A selecao E o estado final desejado: grava uma vez e conta o diff."""
+    pm, dates = get_skips()
+    atuais = [x for x in dates if not cal_blocked(datetime.date.fromisoformat(x))]
+    novos = [d.isoformat() for d in sel]
+    add = [x for x in novos if x not in atuais]
+    rem = [x for x in atuais if x not in novos]
+    if not add and not rem:
+        send("Nada mudou — a lista de pulos continua a mesma.")
+        return
+    write_skips(pm, novos)
+    partes = []
+    if add:
+        partes.append("🚫 Vou pular: " + ", ".join(fmt(datetime.date.fromisoformat(x)) for x in add))
+    if rem:
+        partes.append("✅ Volta a rodar: " + ", ".join(fmt(datetime.date.fromisoformat(x)) for x in rem))
+    send("\n".join(partes) + "\n\nPra mexer de novo: /pular")
+    log(f"pulos gravados: {novos}")
+
+
 def handle_callback(cq):
     global pending
-    api("answerCallbackQuery", {"callback_query_id": cq["id"]})
     msg = cq.get("message")
-    if msg:  # remove os botoes da pergunta ja respondida
-        api("editMessageReplyMarkup", {"chat_id": CHAT_ID, "message_id": msg["message_id"]})
+    mid = msg["message_id"] if msg else None
     data = cq.get("data", "")
-    if data.startswith("pular:"):
+    picked = inline_calendar.parse(data)
+
+    # Dia bloqueado nao muda nada: a resposta do callback E o feedback (balao).
+    why = cal_blocked(picked[1]) if picked and picked[0] == "blocked" else ""
+    answer = {"callback_query_id": cq["id"]}
+    if why:
+        answer["text"] = f"{fmt(picked[1])} {why}."
+    api("answerCallbackQuery", answer)
+
+    if picked:
+        kind, d = picked
+        sel = inline_calendar.selection(msg.get("text") if msg else None, parse_date)
+        if kind == "blocked":
+            return
+        if kind == "nav":  # so redesenha o mes, a selecao continua no texto
+            show_calendar(mid, d, sel)
+        elif kind == "toggle":
+            show_calendar(mid, d, [x for x in sel if x != d] if d in sel else sorted(sel + [d]))
+        else:
+            set_markup(mid)
+            pending = None
+            if kind == "ok":
+                cal_confirm(sel)
+            else:
+                send("Ok, nada mudou.")
+    elif data == "pular:calendario":
+        open_calendar(mid)
+    elif data.startswith("pular:"):
+        set_markup(mid)
         pending = None
         do_pular(parse_date(data.split(":", 1)[1]))
 
