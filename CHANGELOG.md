@@ -6,6 +6,8 @@ de um `git pull`:
 - `[rotina]` — mexe no roteiro do modo B: sua rotina no claude.ai está desatualizada
   até você rodar `/setup-checkin` (ou pedir ao Claude "atualize minha rotina").
 - `[cli]` / `[extensão]` — o `git pull` já resolve (extensão: recarregue em `chrome://extensions`).
+- `[local]` — o `git pull` **não** basta: a mudança pede editar o seu `config.json`
+  (campo novo) ou a linha do `crontab`. Rode `/setup-checkin` e ele aplica.
 - `[worker]` — o admin faz `wrangler deploy`; quem usa `/runner on` não faz nada.
 - `[setup]` — só afeta quem está configurando pela primeira vez.
 
@@ -13,6 +15,53 @@ A versão mais recente com `[rotina]` é o carimbo que vai na primeira linha do
 prompt da rotina (`# lab-checkin roteiro <versão>`).
 
 ---
+
+## 2026-08-27 — `[rotina]` `[worker]` `[cli]`
+
+**Quem escolheu e-mail agora é avisado quando a rotina falha — e quando ela
+nem roda.** O ❌ por e-mail já existia, mas só saía se a rotina chegasse viva
+até o bloco `Notificar`. Fora daí era silêncio: execução que morre no meio
+(limite de token, conector caído, comando preso em aprovação), rotina pausada
+ou sem crédito, e — o pior — o próprio e-mail sendo recusado (403 de domínio,
+502 sem `RESEND_API_KEY`, host do worker fora da allowlist de egress) enquanto
+a execução era marcada como **sucesso** no histórico. Cego dos dois lados.
+
+Quatro consertos, três deles no prompt da rotina:
+
+- **Aviso que não sai derruba a execução.** Resposta do `/notify` fora do 2xx
+  agora encerra a rotina com erro, em vez de só registrar o corpo no log. Se o
+  dev não pode ser avisado, ao menos o histórico fica vermelho.
+- **Erro não previsto tenta avisar antes de morrer.** A variante "sem canal" já
+  mandava encerrar com erro; as outras não mandavam nada.
+- **A guarda do `/pular` sai quando não há Telegram.** Ela lia a mensagem
+  fixada via `getChat` — sem bot token, um dev só-de-e-mail tropeçava numa
+  guarda antes de fazer qualquer coisa.
+- **O runner do worker parou de furar o `prefs.email`.** O `runnerCron` mandava
+  o ❌ com `send()` direto no Telegram, enquanto o `/notify` resolvia o canal
+  pelo KV — dois lugares decidindo a mesma coisa de jeitos diferentes. Agora só
+  existe um, o `deliver()`, e quem escolheu e-mail recebe por e-mail nos dois
+  caminhos.
+- **Watchdog no worker** (`watchdogCron`), o único que pega "a rotina não
+  rodou": ela pinga `POST /notify` com `{"email": ..., "heartbeat": true}` em
+  **todo** desfecho — inclusive quando para numa guarda — e o tick das 18h de
+  SP cobra por e-mail quem não pingou no dia.
+
+O heartbeat é o caminho barato: a alternativa era o worker conferir o Lab
+sozinho, e para isso ele precisaria do cookie, da iniciativa e de um cadastro
+de cada dev de e-mail — coisas que hoje só existem para quem passou pelo
+`/config` do bot. O ping não precisa de nada: o registro `watch:<email>` nasce
+no primeiro sinal de vida (ou na primeira notificação entregue) e expira 30
+dias depois do último, então rotina abandonada para de cobrar sozinha. O
+marcador `alerted` garante um e-mail por dia, não um por tick, e a cobrança só
+é marcada se o e-mail realmente saiu.
+
+Custo conhecido: a cobrança sai num horário fixo para todo mundo (18h de SP,
+o último tick do cron). Quem agendar a rotina para depois disso precisa de um
+horário por dev no registro.
+
+Admin: `wrangler deploy`. Dev: `/setup-checkin` para atualizar a rotina — sem
+isso não há heartbeat e o watchdog cobra em falso. Checagem:
+`node worker/test_notify.mjs`.
 
 ## 2026-08-26 — `[worker]` `[cli]`
 
@@ -75,6 +124,43 @@ não há Mini App para abrir.
 Admin: `wrangler deploy`. Checagem: `node worker/test_pular.mjs` e
 `python3 inline_calendar.py`.
 
+**Quem não tem Telegram voltou a poder pular um dia — inclusive no modo B.**
+O estado do `/pular` vive na *mensagem fixada* do chat com o bot: sem chat não
+há onde guardar, e por isso a guarda de skip saía inteira do roteiro de quem
+escolheu e-mail. Resultado: rotina na nuvem sem nenhuma forma de cancelar um
+dia — só desligando a rotina na mão, o que agora dispara o watchdog como se ela
+tivesse morrido.
+
+O mesmo estado passou a caber no KV: `GET/POST /skips` guarda as datas em
+`skips:<e-mail>` (mesma identidade que o watchdog usa) com a **auth do
+`/notify`** — `NOTIFY_SECRET` mais o domínio na allowlist, porque o segredo é
+compartilhado no time e sem a trava um dev pularia o dia do outro. A lista
+enviada **é** o estado final, mesmo contrato do calendário do Mini App; o
+worker descarta passado e fim de semana e devolve o que ficou valendo.
+
+Do lado do dev não há comando novo: `checkin.sh pular/retomar/pulos` já
+existiam e já liam `notify.{url,secret,email}` — agora espelham o
+`.skips.json` no worker e imprimem `Skips na nuvem: ...` de volta. Sem os três
+campos, seguem só locais e calados sobre a nuvem. Falha no espelho **não**
+derruba o comando (o skip local já está gravado), mas avisa, porque o silêncio
+aqui seria um check-in enviado num dia que o dev achou que tinha cancelado.
+Reenviar a lista é idempotente, então `pulos` também conserta um espelho que
+falhou antes — não existe um caminho de leitura separado.
+
+Na rotina, a guarda 2 deixou de ser removida na variante sem Telegram: em vez
+do `getChat` ela consulta o `/skips`. Se a consulta cair, **segue com o
+check-in** — consulta que falhou não é dia pulado, e parar ali seria um dia sem
+check-in e sem ninguém avisado.
+
+Descartado no caminho: reaproveitar o Mini App fora do Telegram (o auth é o
+`initData`, HMAC do bot token — daria uma página aberta com outro segredo) e
+pôr o calendário no popup da extensão (o modo nuvem + MCP roda **sem
+extensão**, justamente quem precisa disso).
+
+Admin: `wrangler deploy`. Checagem: `node worker/test_pular.mjs` (o teste de
+datas também parou de apodrecer — usava `26/08` fixo, que virou passado e
+passou a rolar para 2027).
+
 ## 2026-08-17 — `[rotina]`
 
 **A rotina parou de pedir aprovação para rodar os próprios passos.** O sandbox
@@ -97,7 +183,7 @@ de desistir e mandar ❌.
 Quem usa rotina: atualize (`/setup-checkin` ou "atualize minha rotina"). Cron
 local e extensão não são afetados — não há camada de permissão no caminho deles.
 
-## 2026-08-13 — `[worker]` `[cli]` `[setup]`
+## 2026-08-13 — `[worker]` `[cli]` `[local]` `[setup]`
 
 **E-mail virou canal de verdade, sem depender do Telegram.** O `POST /notify`
 passou a aceitar `{ email, text }` direto no corpo (antes só resolvia o destino

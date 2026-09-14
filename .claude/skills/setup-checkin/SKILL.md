@@ -26,12 +26,19 @@ mudanças novas do repo, **não refaça o setup**:
 1. Leia o `CHANGELOG.md` e o `.checkin-version` (versão aplicada por último;
    ausente = nunca aplicada). As entradas acima dela são o que ele ainda não tem.
 2. Resuma em 2–3 linhas o que mudou e o que cada tag exige dele: `[rotina]` =
-   rotina do claude.ai desatualizada; `[cli]`/`[extensão]` = o `git pull` já
+   rotina do claude.ai desatualizada; `[local]` = `config.json`/`crontab` dele
+   desatualizados (item 3 abaixo); `[cli]`/`[extensão]` = o `git pull` já
    resolveu (extensão pede recarregar em `chrome://extensions`); `[worker]` =
    deploy do admin, ele não faz nada.
-3. Sem nenhuma entrada `[rotina]`: só grave a versão nova em `.checkin-version`
-   e encerre.
-4. Com entrada `[rotina]`: localize a rotina existente (skill `schedule`, nome
+3. Com entrada `[local]`: a entrada do CHANGELOG diz o que mudou. Leia o
+   `config.json` dele e o `crontab -l`, aponte o que falta (campo novo ausente,
+   linha de cron com horário/formato antigo), **mostre a mudança antes de
+   aplicar** e só então edite — sem tocar em credencial que já funciona e sem
+   apagar outras linhas do crontab. Não sabendo o valor de um campo novo
+   (ex.: secret do admin), peça ao dev em vez de inventar.
+4. Sem entrada `[rotina]` nem `[local]`: só grave a versão nova em
+   `.checkin-version` e encerre.
+5. Com entrada `[rotina]`: localize a rotina existente (skill `schedule`, nome
    com "check-in"/"lab-checkin"), **mostre ao dev o que vai mudar no prompt
    antes de mexer** e atualize só os trechos afetados — credenciais, iniciativas
    e principalmente o bloco `Estilo`/exemplos são dele e não se tocam sem ele
@@ -115,7 +122,8 @@ Pergunte com `AskUserQuestion` qual canal ele quer — **não assuma Telegram**:
 
 - **Telegram** (default se já tem conta) — ✅/❌/🚫 e os comandos remotos.
 - **E-mail** — a rotina manda o resumo para o e-mail dele (etapa 3.2). Sem
-  `/pular`, `/testar` nem `/config` (isso é só do bot).
+  `/testar` nem `/config` (isso é só do bot); para pular dias, `checkin.sh
+  pular` (etapa 3.3).
 - **Nenhum por enquanto** — a rotina roda silenciosa; falha só aparece no
   histórico de execuções da rotina no claude.ai. Diga isso explicitamente.
 
@@ -171,11 +179,50 @@ quebra quando a conta Google dele for desativada.
    compartilhado no time e sem a lista viraria relay aberto). **502** = o admin
    não configurou `RESEND_API_KEY`/`NOTIFY_EMAIL_FROM`.
 3. No modo nuvem, libere o host do worker na allowlist de egress (etapa 7.1).
+4. **Watchdog** (só modo nuvem, automático): a rotina pinga o worker em todo
+   desfecho (`{"email": "...", "heartbeat": true}` — bloco `Sinal de vida` do
+   prompt) e o worker cobra por e-mail às 18h de SP quando o ping do dia não
+   chega. É o que cobre a rotina que **não roda** — pausada, sem crédito, ou
+   morta antes de conseguir avisar. Nada a configurar: o registro nasce no
+   primeiro ping e expira sozinho 30 dias depois do último. Valide junto com
+   o teste acima:
+   ```bash
+   curl -sS -X POST "{NOTIFY_URL}/notify" -H 'content-type: application/json' \
+     -H "x-notify-secret: {NOTIFY_SECRET}" \
+     -d '{"email":"{EMAIL}","heartbeat":true}'
+   ```
+   `{"ok":true,"heartbeat":true}` = registrado (nenhum e-mail é enviado).
 
 **Rota conector Gmail** (só modo nuvem): nada a configurar, o conector é da
 conta do dev — inclua `mcp__Gmail` e `ToolSearch` no `allowed_tools` da rotina.
 Avise do modo de falha: se o OAuth do conector cair, a notificação de falha é
 que falha, calada.
+
+### 3.3 Pular dias sem Telegram
+
+Quem tem o bot usa `/pular` e o calendário. Sem Telegram, o comando é o do
+repo — **funciona igual no modo nuvem**, porque ele espelha as datas no worker:
+
+```bash
+./checkin.sh pular 05/09      # ou hoje / amanha / 2026-09-05
+./checkin.sh retomar 05/09
+./checkin.sh pulos            # lista, e reenvia o espelho se ele tinha falhado
+```
+
+O comando grava em `.skips.json` (que é o que a cron local lê) **e** faz
+`POST /skips` no worker, que guarda em `skips:<e-mail>` — é de lá que a guarda
+da rotina na nuvem lê. Ele imprime `Skips na nuvem: ...` de volta: se essa linha
+não aparecer, o espelho não subiu e a rotina **vai** rodar no dia.
+
+Requisito: `notify.url` + `notify.secret` + `notify.email` no `config.json`.
+Sem os três o comando só grava local, calado sobre a nuvem. Na **rota conector
+Gmail** (etapa 3.2) o dev não recebe URL/secret por causa da notificação —
+peça-os ao admin de todo jeito se ele quiser pular dias, é o mesmo par do
+`/notify`. O domínio do e-mail tem que estar em `NOTIFY_EMAIL_DOMAINS`: o
+secret é compartilhado no time e sem essa trava um dev pularia o dia do outro.
+
+O dev não precisa decorar nada disso — "pula meu check-in de sexta" no Claude
+Code resolve, é este comando.
 
 ## 4. Validar credenciais e descobrir iniciativas
 
@@ -312,11 +359,21 @@ citando o comando.
 `mcp__<connector>` — sem ela o agente não consegue carregar o schema de
 nenhuma tool de conector e reporta "tool não existe".
 
-Guardas — pare silenciosamente se qualquer uma valer:
+Guardas — pare silenciosamente se qualquer uma valer (mas mande o Sinal de
+vida do fim deste prompt ANTES de parar: parada é desfecho, não é sumiço):
 1. Hoje é fim de semana ou feriado nacional/SP (calcule os móveis: Carnaval,
    Sexta-feira Santa, Corpus Christi).
-2. A data de hoje consta na mensagem fixada do meu chat com o bot (leia via
-   getChat; formato "SKIP: YYYY-MM-DD, ..."). Nesse caso notifique 🚫 e pare.
+2. Hoje está na minha lista de dias pulados — leia a mensagem fixada do meu
+   chat com o bot via getChat (formato "SKIP: YYYY-MM-DD, ..."). Estando na
+   lista, notifique 🚫 e pare.
+   [variante sem Telegram — troque a leitura acima por esta, NÃO remova a
+   guarda: sem bot token não existe mensagem fixada para ler (e getChat sem
+   token derrubaria a rotina antes de ela fazer qualquer coisa), mas as datas do
+   `checkin.sh pular` estão no worker:
+   `curl -sf --max-time 10 -H 'x-notify-secret: {NOTIFY_SECRET}' '{NOTIFY_URL}/skips?email={EMAIL}'`
+   e veja se a data de hoje está no `dates` da resposta. Se o curl falhar ou não
+   devolver JSON, **siga com o check-in** em vez de parar: consulta que caiu não
+   é dia pulado, e parar aqui seria um dia sem check-in e sem ninguém avisado.]
 3. O check-in de hoje já está preenchido (GET em
    https://lab.idealtrends.io/saude-entrega/daily com o cookie; os cards vêm
    no atributo data-page, HTML-escaped).
@@ -385,11 +442,31 @@ exporte o config.json na extensão e rode /setup-checkin de novo").
 [Telegram: via sendMessage no chat {CHAT_ID}]
 [E-mail pelo worker: POST {NOTIFY_URL}/notify com header
 x-notify-secret: {NOTIFY_SECRET} e body {"email": "{EMAIL}", "text": "<a
-mensagem>"} — 2xx é entregue; qualquer outro status, registre o corpo da
-resposta no log da execução (403 = domínio fora da allowlist do worker)]
+mensagem>"} — 2xx é entregue. Qualquer outro status: registre o corpo da
+resposta E encerre a execução com erro (403 = domínio fora da allowlist do
+worker; 502 = worker sem RESEND_API_KEY; conexão recusada = host do worker
+fora da allowlist de egress). Aviso que não saiu com a execução marcada como
+sucesso é cego dos dois lados — o histórico da rotina tem que ficar vermelho]
 [E-mail pelo conector Gmail: envie para {EMAIL}, assunto "Check-in {DATA}"]
 [Sem canal: não notifique — mas em falha, encerre a execução com erro para
 ficar registrado no histórico da rotina]
+
+Erro não previsto (qualquer passo acima estourar — tool que sumiu, limite de
+token, comando preso em aprovação): antes de encerrar, tente notificar ❌ com
+o que deu errado; e encerre a execução com erro de qualquer jeito, mesmo que
+o aviso tenha saído. Falha calada é o pior desfecho possível: ninguém preenche
+o check-in e ninguém fica sabendo.
+
+Sinal de vida — a ÚLTIMA coisa que você faz, em todo e qualquer desfecho
+(enviou, falhou, ou parou numa guarda; fim de semana e feriado inclusive):
+POST {NOTIFY_URL}/notify com header x-notify-secret: {NOTIFY_SECRET} e body
+{"email": "{EMAIL}", "heartbeat": true}. Não manda e-mail nenhum — só avisa o
+worker que esta execução aconteceu. É o que permite ao worker cobrar por
+e-mail, no fim do dia, quando a rotina simplesmente não roda (pausada, sem
+crédito, ou morta antes de chegar até aqui) — a única falha que ela mesma
+nunca consegue reportar. Ping a mais não incomoda ninguém; ping a menos vira
+cobrança em falso.
+[só na variante "E-mail pelo worker" — nas outras, remova este bloco]
 ```
 
 Deixe este bloco sempre presente no prompt, com uma das três variantes — é o
@@ -411,8 +488,12 @@ Deixe este bloco sempre presente no prompt, com uma das três variantes — é o
    enviado. Pergunte se **o texto soou como ele** — se soou genérico, o
    conserto é acrescentar exemplos no bloco `Estilo` (etapa 5.1) e atualizar
    a rotina, não mexer em credencial.
-3. Lembre o dev: cookie expirou → ❌ no Telegram → logar no Lab → re-exportar
-   na extensão → rodar `/setup-checkin` de novo (a skill atualiza a rotina).
+3. Lembre o dev: cookie expirou → ❌ no Telegram (ou no e-mail) → logar no Lab
+   → re-exportar na extensão → rodar `/setup-checkin` de novo (a skill atualiza
+   a rotina). E que existem **dois** avisos diferentes no canal de e-mail: o ❌
+   é a rotina dizendo que falhou; o "a rotina nao rodou hoje" é o worker
+   cobrando o silêncio dela — esse segundo quase sempre é a rotina pausada, sem
+   crédito, ou uma execução que morreu no meio (veja o histórico no claude.ai).
 4. Grave a versão mais recente do `CHANGELOG.md` em `.checkin-version` (arquivo
    local, gitignored) — é o que faz o Claude avisar, no próximo `git pull`, que
    saiu mudança que exige atualizar a rotina.

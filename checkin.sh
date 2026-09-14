@@ -31,9 +31,12 @@
 #       Respeita schedule.enabled/schedule.time do config.json (modelo tick).
 #
 #   ./checkin.sh pular DD/MM      (ou hoje/amanha/YYYY-MM-DD)
-#       Cancela o check-in local de uma data (arquivo .skips.json), sem Telegram.
-#   ./checkin.sh retomar DD/MM    Desfaz um skip local.
-#   ./checkin.sh pulos            Lista os skips locais agendados.
+#       Cancela o check-in de uma data (arquivo .skips.json), sem Telegram. Com
+#       notify.url + notify.secret + notify.email no config.json, espelha no
+#       worker (KV skips:<email>) e a ROTINA DA NUVEM tambem pula o dia — e a
+#       alternativa ao /pular do bot para quem nao tem Telegram.
+#   ./checkin.sh retomar DD/MM    Desfaz um skip (local e na nuvem).
+#   ./checkin.sh pulos            Lista os skips agendados (e reenvia o espelho).
 #
 #   ./checkin.sh repos [PADRAO]
 #       Confirmacao (so leitura): lista os repos do workspace que casam com o
@@ -246,8 +249,9 @@ sys.exit(0 if auto_activity.is_holiday(today) else 1)
 "
 }
 
-# Skip LOCAL (arquivo .skips.json) — alternativa ao /pular do Telegram para
-# quem roda so no CLI/cron, sem depender do bot. Formato:
+# Skip LOCAL (arquivo .skips.json) — alternativa ao /pular do Telegram, sem
+# depender do bot; push_skips() espelha no worker para a rotina da nuvem ver o
+# mesmo estado. Formato:
 #   {"skips": ["YYYY-MM-DD", ...]}
 is_locally_skipped() {
     [ -f "$SKIPS_FILE" ] || return 1
@@ -320,17 +324,76 @@ print(msg)
 PY
 }
 
+# Espelha o .skips.json no worker (POST /skips, KV skips:<email>) para a ROTINA
+# DA NUVEM tambem pular o dia. E a alternativa ao /pular do Telegram: o estado do
+# /pular vive na mensagem fixada do chat com o bot, e quem escolheu e-mail nao
+# tem chat. Precisa de notify.url + notify.secret + notify.email no config.json;
+# sem os tres, nao faz nada (fluxo de quem usa Telegram ou so o cron local
+# intacto). Falha aqui NAO derruba o comando: o skip local ja esta gravado.
+#
+# Vale tambem no `pulos`: reenviar a lista inteira e idempotente e conserta um
+# espelhamento que falhou antes — por isso nao existe um caminho de leitura
+# separado.
+push_skips() {
+    local url secret email fields payload out
+    [ -f "$CONFIG" ] || return 0
+    fields="$(python3 -c '
+import json, sys
+try:
+    n = json.load(open(sys.argv[1])).get("notify", {}) or {}
+except Exception:
+    n = {}
+print(n.get("url", ""))
+print(n.get("secret", ""))
+print(n.get("email", ""))
+' "$CONFIG")" || return 0
+    url="$(sed -n 1p <<<"$fields")"
+    secret="$(sed -n 2p <<<"$fields")"
+    email="$(sed -n 3p <<<"$fields")"
+    [ -n "$url" ] && [ -n "$secret" ] && [ -n "$email" ] || return 0
+
+    payload="$(python3 -c '
+import json, sys
+try:
+    skips = json.load(open(sys.argv[2])).get("skips") or []
+except Exception:
+    skips = []
+print(json.dumps({"email": sys.argv[1], "dates": skips}))
+' "$email" "$SKIPS_FILE")" || return 0
+
+    if ! out="$(curl -sf --max-time 10 \
+        -H "content-type: application/json" \
+        -H "x-notify-secret: ${secret}" \
+        --data-raw "$payload" \
+        "${url%/}/skips")"; then
+        echo "AVISO: skip gravado localmente, mas o worker nao aceitou o espelho — a rotina da nuvem ainda vai rodar nesse dia. Rode 'checkin.sh pulos' depois para tentar de novo." >&2
+        return 0
+    fi
+    # Mostra o que ficou valendo na nuvem: o worker descarta fim de semana e
+    # passado, entao a lista de volta e o que a rotina de fato vai respeitar.
+    python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+print("Skips na nuvem: " + (", ".join(d.get("dates") or []) or "nenhum"))
+' "$out"
+}
+
 cmd_pular() {
     [ -n "${1:-}" ] || { echo "ERRO: uso: checkin.sh pular DD/MM (ou hoje/amanha/YYYY-MM-DD)" >&2; exit 1; }
     skip_tool add "$1"
+    push_skips
 }
 
 cmd_retomar() {
     [ -n "${1:-}" ] || { echo "ERRO: uso: checkin.sh retomar DD/MM" >&2; exit 1; }
     skip_tool remove "$1"
+    push_skips
 }
 
-cmd_pulos() { skip_tool list; }
+cmd_pulos() { skip_tool list; push_skips; }
 
 # Confirmacao de repositorios (so leitura) — delega ao auto_activity.py.
 cmd_repos() { python3 "$DIR/auto_activity.py" --list-repos "$@"; }

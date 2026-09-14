@@ -31,6 +31,16 @@
  * Quem nao tem Telegram manda { email, text }: entrega direto por Resend, com
  * o dominio do destinatario conferido contra NOTIFY_EMAIL_DOMAINS.
  *
+ * Pular dias sem Telegram: GET/POST /skips (mesma auth do /notify) guarda as
+ * datas em KV skips:<email>, porque o estado do /pular vive na mensagem fixada
+ * do chat e quem so tem e-mail nao tem chat. O `checkin.sh pular` espelha para
+ * la e a guarda da rotina na nuvem le de la. Ver handleSkips.
+ *
+ * Watchdog do modo nuvem: { email, heartbeat: true } no /notify e sinal de vida
+ * da rotina do claude.ai. O cron cobra no fim do dia quem nao pingou — e a
+ * unica coisa que pega "a rotina nem rodou", que por definicao nao se notifica
+ * sozinha. Ver watchdogCron.
+ *
  * Env: BOT_TOKEN (secret), WEBHOOK_SECRET (secret), KV_ENC_KEY (secret,
  * 32 bytes em base64), ADMIN_CHAT_ID (var), USERS (KV namespace).
  * Opcionais: NOTIFY_SECRET (secret, habilita /notify), RESEND_API_KEY +
@@ -46,6 +56,7 @@ const ASK_TEXT =
 const ASK_INITIATIVE = 'Qual a iniciativa padrao? Responda esta mensagem com o ID numerico (ex: 6)';
 const ASK_TIME = 'Qual horario do check-in automatico? Responda esta mensagem com HH:MM (ex: 09:30)';
 const SETUP_TTL_S = 600; // 10 minutos
+const SKIPS_TTL_S = 90 * 86400; // skips:<email> abandonado morre sozinho
 const REPOS_PAGE = 12; // repos por pagina no teclado do /repos
 const WD_PT = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'];
 const HELP =
@@ -100,6 +111,14 @@ export default {
         return jsonCors({ ok: false, error: 'internal' }, 500);
       }
     }
+    if (url.pathname === '/skips') {
+      try {
+        return await handleSkips(request, url, env);
+      } catch (e) {
+        console.error('erro no /skips', e);
+        return jsonCors({ ok: false, error: 'internal' }, 500);
+      }
+    }
     if (url.pathname === '/devlink') {
       try {
         return await handleDevlink(request, url, env);
@@ -131,6 +150,7 @@ export default {
   // /runner. Inerte enquanto ninguem optou. Ver wrangler.toml [triggers].
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runnerCron(env));
+    ctx.waitUntil(watchdogCron(env));
   },
 };
 
@@ -1032,6 +1052,24 @@ function emailAllowed(email, domains) {
   return allow.includes(m[1]);
 }
 
+// Escolhe o canal do dev e entrega: e-mail quando ele tem um (o do corpo do
+// /notify, senao prefs.email do KV), Telegram como alternativa. E o UNICO lugar
+// que decide isso — o runnerCron chamava send() direto e furava o prefs.email de
+// quem escolheu e-mail, mandando o ❌ para um canal que a pessoa nao le.
+async function deliver(env, chatId, text, askedEmail = '') {
+  const user = chatId ? await getUser(env, chatId) : null;
+  const email = askedEmail || user?.prefs?.email || '';
+  let delivered = false;
+  if (email) {
+    delivered = await sendEmail(env, email, 'Auto Check-in', text);
+    // Notificacao entregue tambem e sinal de vida — arma o watchdog sem exigir
+    // cadastro: quem ja recebe aviso passa a ser cobrado quando parar de avisar.
+    if (delivered) await touchWatch(env, email);
+  }
+  if (!delivered && chatId) delivered = !!(await send(env, chatId, text)).ok;
+  return { delivered, email };
+}
+
 // POST /notify — { chatId, text } ou { email, text } (ou os dois). Com chatId o
 // worker resolve o canal do dev pelo KV (e-mail de prefs.email se houver,
 // Telegram caso contrario); com email no corpo entrega direto por Resend, que e
@@ -1052,21 +1090,22 @@ async function handleNotify(request, env) {
   const chatId = Number(body.chatId) || 0;
   const text = (body.text || '').toString();
   const asked = (body.email || '').toString().trim();
-  if ((!chatId && !asked) || !text) {
-    return jsonCors({ ok: false, error: 'chatId ou email, mais text, sao obrigatorios' }, 400);
-  }
   if (asked && !emailAllowed(asked, env.NOTIFY_EMAIL_DOMAINS)) {
     return jsonCors({ ok: false, error: 'dominio de e-mail nao liberado em NOTIFY_EMAIL_DOMAINS' }, 403);
   }
-
-  let delivered = false;
-  const user = chatId ? await getUser(env, chatId) : null;
-  const email = asked || user?.prefs?.email;
-  if (email) delivered = await sendEmail(env, email, 'Auto Check-in', text);
-  if (!delivered && chatId) {
-    const r = await send(env, chatId, text);
-    delivered = !!r.ok;
+  // { email, heartbeat: true } — sinal de vida da rotina do claude.ai, sem
+  // entregar nada. E o que separa "a rotina nao rodou" de "nao tinha o que
+  // dizer": sem ele os dois sao o mesmo silencio. Ver watchdogCron.
+  if (body.heartbeat === true) {
+    if (!asked) return jsonCors({ ok: false, error: 'heartbeat exige email' }, 400);
+    await touchWatch(env, asked);
+    return jsonCors({ ok: true, heartbeat: true });
   }
+  if ((!chatId && !asked) || !text) {
+    return jsonCors({ ok: false, error: 'chatId ou email, mais text, sao obrigatorios' }, 400);
+  }
+
+  const { delivered, email } = await deliver(env, chatId, text, asked);
   // 200 com ok:false passava batido no `curl -sf` do checkin.sh (fallback nunca
   // rodava): falha de entrega precisa ser status de erro.
   if (!delivered) {
@@ -1074,6 +1113,67 @@ async function handleNotify(request, env) {
     return jsonCors({ ok: false, error: why }, 502);
   }
   return jsonCors({ ok: true });
+}
+
+// --- /skips: pular dias sem Telegram (KV skips:<email>) -----------------------
+// O estado do /pular vive na MENSAGEM FIXADA do chat com o bot — quem escolheu
+// e-mail nao tem chat, e por isso a guarda de skip saia inteira do roteiro
+// dele: rotina na nuvem sem nenhuma forma de pular um dia. Aqui o mesmo estado
+// mora no KV, chaveado pelo e-mail (mesma identidade que o watchdog usa), e o
+// `checkin.sh pular` espelha para ca.
+//
+// Auth igual a do /notify: NOTIFY_SECRET + dominio na allowlist. O segredo e
+// compartilhado no time — sem a checagem de dominio um dev pularia o check-in
+// de outro (ou de um endereco inventado, enchendo o KV).
+//   GET  ?email=...        -> { ok, today, dates }
+//   POST { email, dates }  -> { ok, today, dates }   (a lista E o estado final)
+async function handleSkips(request, url, env) {
+  if (request.method === 'OPTIONS') return corsPreflight();
+  if (request.method !== 'GET' && request.method !== 'POST') {
+    return jsonCors({ ok: false, error: 'method not allowed' }, 405);
+  }
+  if (!env.NOTIFY_SECRET || request.headers.get('x-notify-secret') !== env.NOTIFY_SECRET) {
+    return jsonCors({ ok: false, error: 'forbidden' }, 403);
+  }
+  let email = (url.searchParams.get('email') || '').toString().trim();
+  let dates = null;
+  if (request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    if (body.email) email = body.email.toString().trim();
+    if (Array.isArray(body.dates)) dates = body.dates;
+  }
+  if (!emailAllowed(email, env.NOTIFY_EMAIL_DOMAINS)) {
+    return jsonCors({ ok: false, error: 'email ausente ou dominio nao liberado em NOTIFY_EMAIL_DOMAINS' }, 403);
+  }
+  const final = dates ? await writeEmailSkips(env, email, dates) : await readEmailSkips(env, email);
+  return jsonCors({ ok: true, today: todayIso(), dates: final });
+}
+
+function skipsKey(email) {
+  return `skips:${email.trim().toLowerCase()}`;
+}
+
+async function readEmailSkips(env, email) {
+  let dates;
+  try {
+    dates = JSON.parse((await env.USERS.get(skipsKey(email))) || '[]');
+  } catch {
+    dates = [];
+  }
+  if (!Array.isArray(dates)) return [];
+  const today = todayIso();
+  return [...new Set(dates)].filter((d) => validIso(d) && d >= today).sort();
+}
+
+/** A lista E o estado final desejado (mesmo contrato do calendario do Mini App).
+ *  Guarda so dia util no futuro: passado nao tem o que pular e fim de semana a
+ *  rotina nem roda — assim o retorno mostra ao dev o que de fato ficou valendo. */
+async function writeEmailSkips(env, email, dates) {
+  const final = [...new Set(dates.map((d) => String(d)))].filter((d) => validIso(d) && !calBlocked(d)).sort();
+  const key = skipsKey(email);
+  if (!final.length) await env.USERS.delete(key);
+  else await env.USERS.put(key, JSON.stringify(final), { expirationTtl: SKIPS_TTL_S });
+  return final;
 }
 
 // /devlink — deep linking com a extensao (Fase 1C).
@@ -2113,6 +2213,87 @@ function scheduleGate(prefs) {
   return now >= time;
 }
 
+// --- watchdog do modo nuvem (dead-man's switch) ------------------------------
+// A rotina do claude.ai avisa quando FALHA, mas nao tem como avisar quando nao
+// roda — pausada, sem credito, ou morta antes de chegar no bloco Notificar. Os
+// tres casos sao silencio, e silencio e indistinguivel de "dia sem novidade".
+// Por isso a rotina pinga /notify com heartbeat:true em TODO desfecho (inclusive
+// quando para nas guardas), e o tick do fim do dia cobra quem nao pingou.
+// Registro: watch:<email> = { email, last, alerted }. Nasce sozinho no primeiro
+// heartbeat (ou na primeira notificacao entregue) e morre de TTL 30 dias depois
+// do ultimo sinal de vida — rotina abandonada para de cobrar sozinha.
+// ponytail: cobranca num horario fixo para todo mundo; se alguem agendar a
+// rotina depois das 18h SP, o jeito e um horario por dev no registro.
+const WATCHDOG_HOUR = 18;
+const WATCH_TTL_DAYS = 30;
+
+function spHour() {
+  return Number(
+    new Intl.DateTimeFormat('en-GB', { timeZone: SP_TZ, hour: '2-digit', hour12: false }).format(new Date())
+  );
+}
+
+function watchKey(email) {
+  return `watch:${email.trim().toLowerCase()}`;
+}
+
+// TTL contado a partir do ultimo sinal de vida, nao da ultima escrita: senao o
+// marcador `alerted` renovaria os 30 dias todo dia e a cobranca seria eterna.
+function watchTtl(lastIso, todayIso_) {
+  const days = Math.floor((Date.parse(todayIso_) - Date.parse(lastIso)) / 86400000);
+  return Math.max(3600, (WATCH_TTL_DAYS - days) * 86400);
+}
+
+async function touchWatch(env, email) {
+  const today = todayIso();
+  await env.USERS.put(watchKey(email), JSON.stringify({ email: email.trim(), last: today }), {
+    expirationTtl: watchTtl(today, today),
+  });
+}
+
+const WATCHDOG_TEXT = (today) =>
+  `Sua rotina do lab-checkin nao deu sinal de vida hoje (${today}).\n\n` +
+  'Nenhum check-in foi enviado e nenhum erro chegou — os dois sao silencio, entao ' +
+  'o mais provavel e que a rotina nao tenha executado (pausada, sem credito) ou ' +
+  'tenha morrido antes de conseguir avisar.\n\n' +
+  'O que fazer agora:\n' +
+  '1. Preencha o check-in de hoje na mao: https://lab.idealtrends.io/saude-entrega/daily\n' +
+  '2. Abra o historico de execucoes da rotina no claude.ai e veja o que aconteceu.\n' +
+  '3. Se o cookie do Lab expirou: logue no Lab, exporte o config.json na extensao ' +
+  'e rode /setup-checkin de novo.';
+
+// `hour` e `today` sao parametros so para o teste conseguir fixar o relogio.
+async function watchdogCron(env, hour = spHour(), today = todayIso()) {
+  // So no fim do dia: mais cedo, a rotina de quem roda de tarde ainda nao rodou
+  // e a cobranca seria falso alarme. O marcador `alerted` faz o resto dos ticks
+  // do dia serem inertes — um e-mail por dia, nao um por tick.
+  if (hour < WATCHDOG_HOUR) return;
+  let cursor;
+  do {
+    const list = await env.USERS.list({ prefix: 'watch:', cursor });
+    cursor = list.list_complete ? undefined : list.cursor;
+    for (const k of list.keys) {
+      const raw = await env.USERS.get(k.name);
+      if (!raw) continue;
+      let w;
+      try {
+        w = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      if (!w.email || w.last === today || w.alerted === today) continue;
+      const sent = await sendEmail(env, w.email, 'Auto Check-in — a rotina nao rodou hoje', WATCHDOG_TEXT(today));
+      if (!sent) {
+        console.error('watchdog: e-mail nao entregue', w.email);
+        continue; // sem marcar: tenta de novo no proximo tick
+      }
+      await env.USERS.put(k.name, JSON.stringify({ ...w, alerted: today }), {
+        expirationTtl: watchTtl(w.last || today, today),
+      });
+    }
+  } while (cursor);
+}
+
 async function runnerCron(env) {
   let cursor;
   do {
@@ -2129,17 +2310,17 @@ async function runnerCron(env) {
         const out = await runCheckin(env, chatId, { approve: !!user.prefs?.approve });
         // Notifica so quando algo aconteceu de verdade (envio ✅ ou erro ❌);
         // silencia "ja preenchida"/fim de semana/feriado/pular para evitar ruido.
-        if (/[✅❌]/.test(out)) await send(env, chatId, out);
+        if (/[✅❌]/.test(out)) await deliver(env, chatId, out);
       } catch (e) {
         console.error('runnerCron', chatId, e);
-        await send(env, chatId, '❌ Erro no check-in automatico do worker: ' + String(e).slice(0, 200));
+        await deliver(env, chatId, '❌ Erro no check-in automatico do worker: ' + String(e).slice(0, 200));
       }
     }
   } while (cursor);
 }
 
 // exporta para uso futuro / test_draft.mjs
-export { decryptJson, parseDates, calBlocked, initDataChatId, pickerPage, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail, emailAllowed };
+export { decryptJson, parseDates, calBlocked, initDataChatId, pickerPage, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail, emailAllowed, handleSkips, skipsKey, readEmailSkips, writeEmailSkips, watchKey, watchTtl, watchdogCron, WATCH_TTL_DAYS, deliver };
 
 // --- roteamento -----------------------------------------------------------------
 

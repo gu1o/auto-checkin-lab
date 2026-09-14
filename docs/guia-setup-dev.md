@@ -63,22 +63,54 @@ clique.
 
 Sem Telegram? Tudo funciona igual, só sem notificação/comando remoto — deixe
 os campos de Telegram em branco. Você pode receber os avisos por **e-mail**
-em vez do bot (sem `/pular`, `/testar` nem `/config` — isso é só do bot):
+em vez do bot (sem `/testar` nem `/config` — isso é só do bot; para pular dias,
+veja 0.2):
 
 - **Pelo worker** (qualquer domínio, inclusive Outlook/M365, e vale nos modos
   A/B/C): peça a URL e o `NOTIFY_SECRET` ao admin e preencha `notify.url`,
   `notify.secret` e `notify.email` no `config.json`. Se voltar 403 "dominio
   nao liberado", o admin precisa acrescentar o seu domínio em
-  `NOTIFY_EMAIL_DOMAINS` no worker.
+  `NOTIFY_EMAIL_DOMAINS` no worker. No **modo B** você também recebe a
+  cobrança do watchdog: a rotina dá um sinal de vida ao worker em todo
+  desfecho, e se num dia útil o sinal não chega até as 18h você recebe um
+  "a rotina nao rodou hoje". É o aviso que pega a rotina pausada ou sem
+  crédito — situação em que ela não tem como reclamar de si mesma.
 - **Pelo conector Gmail** (só modo B, e só se seu e-mail for Google): a rotina
   usa o conector da sua conta. Cuidado: se o OAuth do conector cair, é
   justamente o aviso de falha que some.
+
+### 0.2 Pular dias sem Telegram
+
+Quem tem o bot manda `/pular` e escolhe no calendário. Sem Telegram o comando
+é o do repo — e vale **também no modo B**, porque ele espelha as datas no
+worker:
+
+```bash
+./checkin.sh pular 05/09      # ou hoje / amanha / 2026-09-05
+./checkin.sh retomar 05/09
+./checkin.sh pulos            # lista, e reenvia o espelho se ele falhou antes
+```
+
+O comando grava em `.skips.json` (que é o que o modo A lê) **e** faz
+`POST /skips` no worker, que guarda em `skips:<seu e-mail>` — é de lá que a
+rotina do modo B lê antes de rodar. Ele imprime `Skips na nuvem: ...` de volta:
+**se essa linha não aparecer, o espelho não subiu e a rotina vai rodar no dia.**
+Fim de semana e data passada não entram (a rotina não roda nesses dias), então
+a lista de volta é o que de fato vai valer.
+
+Requisito: `notify.url` + `notify.secret` + `notify.email` no `config.json`
+(o mesmo par do `/notify` — peça ao admin). Sem os três o comando só grava
+local. Seu domínio precisa estar em `NOTIFY_EMAIL_DOMAINS`: o secret é
+compartilhado no time e sem essa trava um dev pularia o dia do outro.
+
+Na prática não precisa decorar: "pula meu check-in de sexta" no Claude Code
+roda esse comando.
 
 Escolher "nenhuma notificação" agora não te prende: rode `/setup-checkin` e
 diga "quero notificação" quando quiser — ele troca só o trecho de aviso da
 rotina, sem mexer nas suas credenciais nem no seu estilo de escrita.
 
-### 0.2 Credenciais que você vai precisar
+### 0.3 Credenciais que você vai precisar
 
 | Credencial | Onde gerar | Usada por |
 |---|---|---|
@@ -293,6 +325,7 @@ atualize minha rotina"* ou `/setup-checkin`.
 |---|---|
 | `[rotina]` | Sua rotina no claude.ai está desatualizada — deixe o Claude reescrever o prompt dela (ele mostra o que muda antes, e não mexe no seu bloco `Estilo` sem você pedir) |
 | `[cli]` | Nada além do `git pull` |
+| `[local]` | O `git pull` não basta: mudou um campo do `config.json` ou a linha do `crontab` — rode `/setup-checkin`, ele mostra o que falta e aplica (vale nos modos A e C) |
 | `[extensão]` | `git pull` + recarregar em `chrome://extensions` |
 | `[worker]` | Nada — o admin faz o deploy; quem usa `/runner on` já pega pronto |
 | `[setup]` | Nada, só afeta quem está configurando pela primeira vez |
