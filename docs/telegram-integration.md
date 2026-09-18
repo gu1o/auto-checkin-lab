@@ -150,6 +150,7 @@ Comandos propostos:
 | `/horario HH:MM` | Atualiza `schedule.time` no `config.json` |
 | `/pausar` / `/retomar` | Alterna `schedule.enabled` |
 | `/agora` | Força `checkin.sh auto` imediatamente (ignora `schedule.time`) |
+| `/forcar` | Reenvia o check-in de hoje ignorando fim de semana/feriado/`/pular` e a aprovação — para retentar depois de uma falha de envio |
 | `/dryrun` | Roda `checkin.sh auto --dry-run` e responde com o rascunho gerado |
 
 **Segurança:** o poller deve ignorar qualquer update cujo `chat_id`/`from.id`

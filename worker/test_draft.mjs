@@ -1,6 +1,6 @@
 // Checagem do fluxo de rascunho/aprovacao do worker: node worker/test_draft.mjs
 import assert from 'node:assert';
-import { genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail } from './worker.js';
+import { genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail, noConvocacao} from './worker.js';
 
 // estilo do dev entra no prompt e some quando nao ha
 const style = 'Ontem: "Fechei o ajuste de permissao." Hoje: "Termino o import."';
@@ -47,5 +47,11 @@ assert.ok(!/novos?.*today_text/.test(detail), 'today_text esta no payload, nao e
 // bag nomeado (props.errors.default) e caso sem erros nenhum
 assert.ok(submitFailureDetail({ props: { errors: { default: { mood_score: 'obrigatorio' } } } }, payload, 302).includes('mood_score'));
 assert.ok(submitFailureDetail({ props: { cards: [] } }, payload, 302).includes('campo obrigatorio novo'));
+
+// --- noConvocacao: cards vazio = o Lab nao pediu check-in hoje ------------------
+const semConv = noConvocacao({ props: { cards: [], semConvocacao: { motivo: 'fora_da_janela', modulos: [{ nome: 'Agenda', motivo: 'versao encerrada' }] } } });
+assert.ok(semConv.includes('fora_da_janela') && semConv.includes('Agenda (versao encerrada)'), 'motivo + modulos');
+assert.equal(noConvocacao({ props: { cards: [{ initiativeId: 6 }] } }), '', 'com card, segue o fluxo normal');
+assert.equal(noConvocacao(null), '', 'props ausente fica permissivo');
 
 console.log('ok');

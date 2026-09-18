@@ -53,7 +53,9 @@ function fakeEnv(entries) {
 }
 
 let sent = [];
-globalThis.fetch = async (_url, opts) => {
+globalThis.fetch = async (url, opts) => {
+  // consulta de feriado nao e envio: a lista estatica do worker ja cobre o teste
+  if (String(url).includes('brasilapi')) return { ok: false, status: 500 };
   sent.push(JSON.parse(opts.body));
   return { ok: true, status: 200, text: async () => '' };
 };
@@ -85,6 +87,23 @@ sent = [];
 env = fakeEnv([['watch:dev@x.com', JSON.stringify({ email: 'dev@x.com', last: HOJE })]]);
 await watchdogCron(env, 18, HOJE);
 assert.equal(sent.length, 0);
+
+// dia sem check-in a fazer nao se cobra: silencio ali e o esperado
+sent = [];
+env = silencioso();
+await watchdogCron(env, 18, '2026-08-29'); // sabado
+await watchdogCron(env, 18, '2026-08-30'); // domingo
+await watchdogCron(env, 18, '2026-09-07'); // feriado (Independencia)
+assert.equal(sent.length, 0, 'fim de semana e feriado nao podem virar cobranca');
+
+// dia que o dev pulou tambem nao: a rotina nao rodar ali e o combinado
+sent = [];
+env = fakeEnv([
+  ['watch:dev@x.com', JSON.stringify({ email: 'dev@x.com', last: '2026-08-26' })],
+  ['skips:dev@x.com', JSON.stringify([HOJE])],
+]);
+await watchdogCron(env, 18, HOJE);
+assert.equal(sent.length, 0, 'dia pulado nao pode virar cobranca');
 
 // e-mail que nao saiu nao pode ser marcado como cobrado
 sent = [];

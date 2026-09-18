@@ -5,3 +5,4 @@ cookies.txt
 .claude/.setup-declined
 .checkin-version
 __pycache__/
+.auto_state.json

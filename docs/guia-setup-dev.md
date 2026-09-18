@@ -305,6 +305,17 @@ Siga o README principal (seções "Opção 2: CLI"): `cookies.txt` +
 `./checkin.sh auto --initiative N --dry-run` e agende na crontab. O modo
 automático respeita as mesmas guardas dos outros modos.
 
+Agende em **três horários** (ex.: `30 9,12,16 * * 1-5`), não em um: se o Lab
+estiver fora do ar na hora do envio, o tick seguinte refaz. O dia **resolvido**
+fica gravado em `.auto_state.json` e os ticks restantes param nele antes de
+gastar Jira/Bitbucket/IA — em dia normal a retentativa é de graça. Resolvido
+inclui o dia em que não havia nada a enviar (pulado no bot ou no
+`checkin.sh pular`, fim de semana, feriado, Lab sem convocação): a retentativa
+não tenta de novo nem repete o aviso — ele sai uma vez só. Um `retomar` no
+mesmo dia destrava o dia que tinha sido fechado pelo skip. Para forçar
+na mão a qualquer momento: `./checkin.sh auto --force` (ignora horário, fim de
+semana, feriado, skip e o `.auto_state.json`).
+
 ---
 
 ## Mantendo atualizado

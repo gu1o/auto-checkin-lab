@@ -250,7 +250,9 @@ liste os **cards de iniciativas vinculadas** do dev (`initiativeId`,
 Pergunte ao dev (com defaults):
 
 - **Horário** do check-in (default 09:30, seg–sex; a rotina pula fim de
-  semana/feriado sozinha de qualquer forma).
+  semana/feriado sozinha de qualquer forma). No modo nuvem esse é o horário da
+  **primeira** tentativa: a etapa 6-nuvem agenda mais duas no mesmo dia, que só
+  fazem algo se o envio tiver falhado.
 - **Iniciativa(s)**: mostre as encontradas no Lab. Uma só → essa é a padrão.
   Mais de uma em que ele trabalha → monte o mapa por iniciativa
   (`initiative_config` do export já pode trazer repos/projetos Jira por
@@ -301,21 +303,43 @@ acrescente a entrada de cron, sem apagar as existentes e sem duplicar
 (`crontab -l` primeiro; se já houver linha com `checkin.sh`, substitua-a):
 
 ```
-{MIN} {HORA} * * 1-5 cd {REPO} && ./checkin.sh auto >> /tmp/lab-checkin.log 2>&1
+{MIN} {H1},{H2},{H3} * * 1-5 cd {REPO} && ./checkin.sh auto >> /tmp/lab-checkin.log 2>&1
 ```
+
+Três horários, não um: o escolhido na etapa 5 mais duas retentativas ~3h depois,
+sem passar das 18h (09:30 → `30 9,12,16`) — mesma lógica do modo nuvem, para o
+dia em que o Lab está fora do ar na hora do envio. Só a execução que resolve o
+dia custa alguma coisa: ela grava `.auto_state.json` e as seguintes param nele
+antes de tocar no Jira/Bitbucket/IA. "Resolver" inclui os dias em que não há o
+que enviar — pulado (`/pular` ou `checkin.sh pular`), fim de semana, feriado,
+Lab sem convocação —, então o aviso desses dias também sai uma vez só. Dia sem atividade não grava — de propósito,
+o tick da tarde pega o commit que apareceu depois. Retentativa não conserta
+cookie expirado nem campo novo no formulário: aí as três falham igual.
 
 Alternativa se a máquina costuma estar desligada no horário: `schedule.enabled`
 / `schedule.time` no config + cron de tick a cada 15 min (`*/15 * * * *`) — o
-gate interno só envia no/depois do horário e uma vez por dia. Pule para a
-etapa 7 (só o item 3 se aplica).
+gate interno só envia no/depois do horário, e o `.auto_state.json` faz os ticks
+seguintes saírem de graça. Pule para a etapa 7 (só o item 3 se aplica).
 
 ### 6-nuvem — rotina agendada no claude.ai
 
 Monte o prompt da rotina a partir do template abaixo, preenchendo os
 placeholders com os dados do config (as credenciais entram no corpo da rotina,
 que é privada da conta do dev). Em seguida crie a rotina com a skill
-`schedule`: diária, seg–sex, no horário escolhido, timezone
-`America/Sao_Paulo`, nome `lab-checkin`.
+`schedule`: seg–sex, timezone `America/Sao_Paulo`, nome `lab-checkin`, cron
+`{MIN} {H1},{H2},{H3} * * 1-5` — o horário escolhido na etapa 5 mais duas
+retentativas ~3h depois, sem passar das 18h (09:30 → `30 9,12,16`; 14:00 →
+`0 14,16,18`).
+
+As retentativas existem para o dia em que o envio falha sem ser culpa da
+rotina: Lab fora do ar, formulário sem o modal de envio, 5xx no POST. Dia que
+não tem check-in a fazer — fim de semana, feriado, dia pulado, Lab sem
+convocação — não é caso de retentativa nenhuma: as guardas param as três
+execuções, e o aviso (🚫 ou ℹ️) sai uma vez só, não uma por horário. Em dia
+normal elas não custam quase nada — com o card já preenchido a execução para na
+guarda 3, antes de tocar no Jira e no Bitbucket, e não notifica ninguém. O que
+elas **não** resolvem é cookie expirado ou campo novo no formulário: aí as três
+falham igual, e o ❌ é para o dev agir.
 
 A primeira linha do prompt carimba a versão do roteiro (a mais recente do
 `CHANGELOG.md`) — é o que permite, num `git pull` futuro, saber se a rotina
@@ -365,7 +389,10 @@ vida do fim deste prompt ANTES de parar: parada é desfecho, não é sumiço):
    Sexta-feira Santa, Corpus Christi).
 2. Hoje está na minha lista de dias pulados — leia a mensagem fixada do meu
    chat com o bot via getChat (formato "SKIP: YYYY-MM-DD, ..."). Estando na
-   lista, notifique 🚫 e pare.
+   lista, pare — e notifique 🚫 **uma vez só**: apenas se esta execução for a
+   do primeiro horário do dia ({H1}); nas retentativas pare calado (só o Sinal
+   de vida). Dia pulado não tem nada a retentar, e três 🚫 iguais treinam o
+   dev a ignorar o aviso.
    [variante sem Telegram — troque a leitura acima por esta, NÃO remova a
    guarda: sem bot token não existe mensagem fixada para ler (e getChat sem
    token derrubaria a rotina antes de ela fazer qualquer coisa), mas as datas do
@@ -374,9 +401,18 @@ vida do fim deste prompt ANTES de parar: parada é desfecho, não é sumiço):
    e veja se a data de hoje está no `dates` da resposta. Se o curl falhar ou não
    devolver JSON, **siga com o check-in** em vez de parar: consulta que caiu não
    é dia pulado, e parar aqui seria um dia sem check-in e sem ninguém avisado.]
-3. O check-in de hoje já está preenchido (GET em
+3. O Lab não pediu check-in hoje: `props.cards` vem VAZIO e `props.semConvocacao`
+   diz o motivo (janela fechada, módulo concluído, versão encerrada). NÃO é erro
+   e retentar não muda nada — encerre sem erro, notificando ℹ️ com o motivo só na
+   última execução do dia. Sem esta guarda o dia vira três ❌ iguais.
+4. O check-in de hoje já está preenchido (GET em
    https://lab.idealtrends.io/saude-entrega/daily com o cookie; os cards vêm
-   no atributo data-page, HTML-escaped).
+   no atributo data-page, HTML-escaped). É esta guarda que faz a retentativa
+   sair barata: a rotina roda mais de uma vez por dia e, com o dia já
+   resolvido, para aqui antes de coletar qualquer coisa.
+   [SE MULTI-INICIATIVA: só pare se TODAS as iniciativas do mapa já tiverem
+   card preenchido; faltando alguma, siga — no Enviar você manda só as que
+   faltam.]
 
 Coleta: minhas issues do Jira atualizadas desde o último dia útil
 (assignee = currentUser()) e meus commits no Bitbucket desde então
@@ -415,7 +451,9 @@ check-in POR iniciativa com atividade; iniciativas sem atividade hoje não
 recebem envio; atividade sem mapeamento vai para a iniciativa {DEFAULT} —
 mencione isso na notificação.
 
-Enviar (por iniciativa): POST em /saude-entrega/daily — renove a sessão com
+Enviar (por iniciativa): pule a iniciativa cujo card já veio preenchido no GET
+da guarda 3 — reenviar duplicaria o check-in do dia. POST em
+/saude-entrega/daily — renove a sessão com
 um GET (o Set-Cookie devolve XSRF-TOKEN), mande o XSRF url-decodificado no
 header x-xsrf-token, headers x-inertia: true e x-requested-with:
 XMLHttpRequest. Body JSON: initiative_id, checkin_date (hoje, YYYY-MM-DD),
@@ -438,7 +476,9 @@ de novo.
 
 Notificar: ✅ com o resumo enviado (um por iniciativa) em sucesso; ❌ com a
 causa provável em falha (se for o cookie expirado, diga: "logue no Lab,
-exporte o config.json na extensão e rode /setup-checkin de novo").
+exporte o config.json na extensão e rode /setup-checkin de novo"). Todo ❌
+termina dizendo que a rotina tenta de novo sozinha no próximo horário de hoje
+e que, se nenhuma tentativa passar, o check-in precisa ser preenchido na mão.
 [Telegram: via sendMessage no chat {CHAT_ID}]
 [E-mail pelo worker: POST {NOTIFY_URL}/notify com header
 x-notify-secret: {NOTIFY_SECRET} e body {"email": "{EMAIL}", "text": "<a

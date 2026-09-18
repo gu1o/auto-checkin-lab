@@ -72,6 +72,7 @@ const HELP =
   '/testar — valida as credenciais salvas (Jira, Bitbucket, Lab, IA) sem enviar nada\n' +
   '/dryrun — gera o rascunho do check-in de hoje sem enviar\n' +
   '/agora — roda e envia o check-in agora\n' +
+  '/forcar — reenvia o check-in de hoje ignorando as guardas (use quando o envio falhou)\n' +
   '/aprovar on|off — revisar o rascunho no chat (botoes ✅/✏️) antes de enviar\n' +
   '/runner on|off — deixa o worker enviar seu check-in automaticamente (opt-in)';
 
@@ -1153,7 +1154,7 @@ function skipsKey(email) {
   return `skips:${email.trim().toLowerCase()}`;
 }
 
-async function readEmailSkips(env, email) {
+async function readEmailSkips(env, email, today = todayIso()) {
   let dates;
   try {
     dates = JSON.parse((await env.USERS.get(skipsKey(email))) || '[]');
@@ -1161,7 +1162,6 @@ async function readEmailSkips(env, email) {
     dates = [];
   }
   if (!Array.isArray(dates)) return [];
-  const today = todayIso();
   return [...new Set(dates)].filter((d) => validIso(d) && d >= today).sort();
 }
 
@@ -1904,6 +1904,18 @@ function submitFailureDetail(props, payload, status) {
       : '');
 }
 
+/** O Lab pode simplesmente NAO pedir check-in num dia util: props.cards vem vazio
+ *  e props.semConvocacao diz o porque (janela fechada, modulo concluido, versao
+ *  encerrada). Nao e falha e reenviar nao muda nada — devolve o motivo, ou ''
+ *  (props ausente fica permissivo, como as demais guardas por-iniciativa). */
+function noConvocacao(props) {
+  const p = props?.props;
+  if (!p || !Array.isArray(p.cards) || p.cards.length) return '';
+  const sc = p.semConvocacao || {};
+  const mods = (sc.modulos || []).map((m) => `${m.nome} (${m.motivo})`).join('; ');
+  return `${sc.motivo || 'sem convocacao'} — ${mods || 'sem detalhe'}`;
+}
+
 function labIsSubmitted(props, initId) {
   const cards = props?.props?.cards || [];
   return cards.some((c) => Number(c.initiativeId) === Number(initId) && c.existing);
@@ -2038,6 +2050,9 @@ async function runCheckin(env, chatId, { dryRun = false, force = false, approve 
   const session = await labSession(secrets);
   if (!session.ok) return `❌ ${labSessionError(session)}`;
 
+  const semConv = noConvocacao(session.props);
+  if (semConv) return `ℹ️ O Lab nao pediu check-in hoje: ${semConv}. Se isso estiver errado, fale com o admin do Lab.`;
+
   const results = [];
   if (warnings.length) results.push('⚠️ ' + warnings.join(' | '));
   for (const c of checkins) {
@@ -2048,6 +2063,7 @@ async function runCheckin(env, chatId, { dryRun = false, force = false, approve 
     const r = await labSubmit(session, { initiative: c.initiative, date: t, yesterday: c.yesterday, today: c.today });
     results.push(r.ok ? `✅ Iniciativa ${c.initiative} enviada (HTTP ${r.status}).` : `❌ Iniciativa ${c.initiative}: ${r.error || `HTTP ${r.status}`}.`);
   }
+  if (results.some((l) => l.startsWith('❌'))) results.push('Quando o Lab voltar, tente de novo com /forcar.');
   return results.join('\n');
 }
 
@@ -2204,6 +2220,15 @@ async function doAgora(env, chatId) {
   if (out) await send(env, chatId, out); // vazio = virou rascunho para aprovar
 }
 
+// Recuperacao de falha (Lab fora do ar, form sem modal, cookie renovado): roda
+// com force, ou seja, sem as guardas de fim de semana/feriado/pular e sem passar
+// pela aprovacao. A guarda de "ja preenchida" continua valendo — ela e o que
+// impede um check-in duplicado no card.
+async function doForcar(env, chatId) {
+  await send(env, chatId, 'Forcando o check-in (ignora horario, fim de semana, feriado e /pular; envia sem pedir aprovacao)...');
+  await send(env, chatId, await runCheckin(env, chatId, { force: true }));
+}
+
 // --- Cron Trigger: roda para cada usuario active que optou pelo runner -----------
 
 function scheduleGate(prefs) {
@@ -2268,6 +2293,12 @@ async function watchdogCron(env, hour = spHour(), today = todayIso()) {
   // e a cobranca seria falso alarme. O marcador `alerted` faz o resto dos ticks
   // do dia serem inertes — um e-mail por dia, nao um por tick.
   if (hour < WATCHDOG_HOUR) return;
+  // Dia em que nao havia check-in a fazer nao se cobra: silencio em fim de
+  // semana e feriado e o comportamento correto, nao rotina morta. (Skip do dev:
+  // por e-mail, logo abaixo — depende de quem e o dono do registro.)
+  const wd = weekday(today);
+  if (wd === 0 || wd === 6) return;
+  if (await isHolidayIso(today)) return;
   let cursor;
   do {
     const list = await env.USERS.list({ prefix: 'watch:', cursor });
@@ -2282,6 +2313,7 @@ async function watchdogCron(env, hour = spHour(), today = todayIso()) {
         continue;
       }
       if (!w.email || w.last === today || w.alerted === today) continue;
+      if ((await readEmailSkips(env, w.email, today)).includes(today)) continue; // dia que o dev pulou
       const sent = await sendEmail(env, w.email, 'Auto Check-in — a rotina nao rodou hoje', WATCHDOG_TEXT(today));
       if (!sent) {
         console.error('watchdog: e-mail nao entregue', w.email);
@@ -2320,7 +2352,7 @@ async function runnerCron(env) {
 }
 
 // exporta para uso futuro / test_draft.mjs
-export { decryptJson, parseDates, calBlocked, initDataChatId, pickerPage, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail, emailAllowed, handleSkips, skipsKey, readEmailSkips, writeEmailSkips, watchKey, watchTtl, watchdogCron, WATCH_TTL_DAYS, deliver };
+export { decryptJson, parseDates, calBlocked, initDataChatId, pickerPage, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, noConvocacao, submitFailureDetail, emailAllowed, handleSkips, skipsKey, readEmailSkips, writeEmailSkips, watchKey, watchTtl, watchdogCron, WATCH_TTL_DAYS, deliver };
 
 // --- roteamento -----------------------------------------------------------------
 
@@ -2412,6 +2444,8 @@ async function handle(update, env, origin) {
     await doDryrun(env, chatId);
   } else if (low.startsWith('/agora')) {
     await doAgora(env, chatId);
+  } else if (low.startsWith('/forcar') || low.startsWith('/forçar')) {
+    await doForcar(env, chatId);
   } else if (low.startsWith('/config')) {
     await doConfig(env, chatId, origin);
   } else if (low.startsWith('/testar')) {

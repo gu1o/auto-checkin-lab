@@ -207,7 +207,8 @@ o que o dev ajusta no KV passa a valer de fato.
   fluxo do cookie `remember_web` (GET renova sessão + `XSRF-TOKEN` via
   `getSetCookie()`; POST Inertia com os headers do script).
 - **Teste antes de confiar no cron:** `/dryrun` mostra o rascunho sem enviar;
-  `/agora` roda e envia na hora (respeitando fim de semana/feriado/`/pular`).
+  `/agora` roda e envia na hora (respeitando fim de semana/feriado/`/pular`);
+  `/forcar` é o mesmo sem nenhuma dessas guardas, para retentar depois de um ❌.
 - **Notificação de baixo ruído:** o cron só avisa em envio (✅) ou erro (❌);
   cala em já-preenchido / fim de semana / feriado / pulado.
 

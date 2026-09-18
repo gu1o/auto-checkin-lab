@@ -40,7 +40,7 @@ claude.ai (Claude Code na web) o `config.json` não existe — está no
 
 Quem tem Telegram usa o bot; são comandos que **o dev manda no chat**, não algo
 que você roda: `/pular`, `/retomar`, `/pulos` (calendário Mini App), `/testar`,
-`/config`, `/repos`, `/painel`, `/agora`, `/dryrun`, `/aprovar`, `/runner`,
+`/config`, `/repos`, `/painel`, `/agora`, `/forcar`, `/dryrun`, `/aprovar`, `/runner`,
 `/cancelar`. Código em `worker/worker.js` (deploy é do admin).
 
 ## Setup e atualização

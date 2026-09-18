@@ -16,6 +16,74 @@ prompt da rotina (`# lab-checkin roteiro <versão>`).
 
 ---
 
+## 2026-09-17 — `[rotina]` `[cli]` `[worker]`
+
+**Dia sem check-in agora é decidido uma vez, não três.** A retentativa em três
+horários (2026-09-15) valia para todo mundo, inclusive para o dia que já estava
+resolvido por escolha: quem pulou o dia no `/pular` do bot levava um 🚫 por
+execução, e o mesmo acontecia no skip local, no feriado e no "o Lab não pediu
+check-in hoje". Retentar um dia pulado não tem o que consertar — só barulho.
+
+- **CLI: `.auto_state.json` fecha o dia em todo desfecho, não só no envio.**
+  Ele passa a guardar também o motivo (`{"date", "motivo"}`) e a guarda dele
+  virou a **primeira** de todas: pulado (bot ou `checkin.sh pular`), fim de
+  semana, feriado e sem convocação gravam o dia como resolvido, então o 2º e o
+  3º tick saem na hora — sem chamar o Telegram de novo, sem coletar nada e sem
+  repetir o aviso. `checkin.sh retomar hoje` apaga o estado gravado pelo skip,
+  senão o retomar não teria efeito no mesmo dia. `--force` ignora tudo isso.
+- **Rotina (nuvem): 🚫 de dia pulado só na primeira execução.** Nas retentativas
+  a guarda 2 para em silêncio (só o Sinal de vida). Fim de semana e feriado já
+  paravam calados.
+- **Worker: o watchdog parou de cobrar em dia que não tinha check-in.** A
+  cobrança das 18h ("sua rotina não deu sinal de vida hoje") disparava todo
+  sábado e domingo, todo feriado e nos dias pulados — justamente os dias em que
+  o silêncio é o comportamento certo. Agora ela sai antes em fim de semana e
+  feriado, e pula quem tem a data em `skips:<e-mail>`.
+
+Aplicar: `git pull` resolve o CLI; `/setup-checkin` (modo atualização) reescreve
+a rotina da nuvem; o admin faz `wrangler deploy` para o watchdog.
+
+## 2026-09-15 — `[rotina]` `[local]` `[worker]`
+
+**Envio que falha agora tem segunda chance — automática na rotina, manual no
+bot.** Quando o Lab cai no horário do check-in (hoje foi a tela sem o modal de
+envio), o dia ficava em branco: a rotina da nuvem roda uma vez, manda o ❌ e
+morre, e `/agora` respeita fim de semana, feriado e `/pular` — no modo aprovação
+ainda devolve o rascunho para confirmar de novo.
+
+- **Rotina (nuvem): três execuções por dia em vez de uma.** O horário escolhido
+  mais duas retentativas ~3h depois (09:30 → `30 9,12,16`). Em dia normal as
+  duas extras param na guarda "já preenchida" antes de tocar no Jira e no
+  Bitbucket — custo perto de zero e nenhuma notificação. A guarda virou por
+  iniciativa: com o mapa multi-iniciativa, ela só para o dia quando **todas**
+  têm card, e o envio pula as que já foram, então uma falha parcial é retentada
+  sem duplicar as que passaram. Todo ❌ agora diz que haverá outra tentativa.
+- **Cron local: mesma coisa, com estado.** A linha do crontab passa a ter três
+  horários. Para a retentativa não custar uma coleta inteira do Jira/Bitbucket e
+  uma geração de IA por tick, o `auto` grava `.auto_state.json` ao fechar o dia
+  e as execuções seguintes param nele — a guarda "já preenchida" existia só
+  dentro do loop, **depois** do gasto. Falha não grava estado (o `cmd_submit`
+  derruba o script), então é exatamente o dia ruim que é retentado. Dia sem
+  atividade também não grava: o tick da tarde pega o commit que apareceu depois.
+  Isso também conserta o desperdício que já existia em quem usa o modelo tick
+  (`*/15` + `schedule.time`). `./checkin.sh auto --force` ignora tudo isso.
+- **"O Lab não pediu check-in hoje" deixou de ser erro.** Num dia útil o Lab
+  pode devolver `props.cards` vazio com `props.semConvocacao` explicando o porquê
+  (janela fechada, módulo concluído, versão encerrada). O roteiro e o `auto` não
+  conheciam esse estado: caíam no "erro não previsto" e mandavam ❌. Com três
+  execuções por dia isso seriam três ❌ iguais, então virou desfecho próprio —
+  encerra sem erro e avisa ℹ️ com o motivo uma vez só, na última execução.
+- **Bot: `/forcar`.** Roda o check-in sem nenhuma guarda de calendário e envia
+  direto, sem passar pela aprovação. A guarda de "já preenchida" continua
+  valendo — é ela que impede duplicata no card. A mensagem de falha cita o
+  comando, para quem levou o ❌ saber o que fazer.
+
+Aplicar: `/setup-checkin` (modo atualização) reagenda a rotina da nuvem e
+reescreve a linha do crontab. O que a retentativa **não** conserta: cookie expirado e campo novo obrigatório
+no formulário falham igual nas três tentativas — nesses o ❌ continua sendo
+para o dev agir. Quem usa `/runner on` não muda nada: o cron do worker já
+retenta a cada 15 min.
+
 ## 2026-08-27 — `[rotina]` `[worker]` `[cli]`
 
 **Quem escolheu e-mail agora é avisado quando a rotina falha — e quando ela
