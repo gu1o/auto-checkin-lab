@@ -31,6 +31,16 @@
  * Quem nao tem Telegram manda { email, text }: entrega direto por Resend, com
  * o dominio do destinatario conferido contra NOTIFY_EMAIL_DOMAINS.
  *
+ * Pular dias sem Telegram: GET/POST /skips (mesma auth do /notify) guarda as
+ * datas em KV skips:<email>, porque o estado do /pular vive na mensagem fixada
+ * do chat e quem so tem e-mail nao tem chat. O `checkin.sh pular` espelha para
+ * la e a guarda da rotina na nuvem le de la. Ver handleSkips.
+ *
+ * Watchdog do modo nuvem: { email, heartbeat: true } no /notify e sinal de vida
+ * da rotina do claude.ai. O cron cobra no fim do dia quem nao pingou — e a
+ * unica coisa que pega "a rotina nem rodou", que por definicao nao se notifica
+ * sozinha. Ver watchdogCron.
+ *
  * Env: BOT_TOKEN (secret), WEBHOOK_SECRET (secret), KV_ENC_KEY (secret,
  * 32 bytes em base64), ADMIN_CHAT_ID (var), USERS (KV namespace).
  * Opcionais: NOTIFY_SECRET (secret, habilita /notify), RESEND_API_KEY +
@@ -40,17 +50,21 @@
 
 const SP_TZ = 'America/Sao_Paulo';
 const SKIP_MARKER = 'SKIP:';
-const ASK_TEXT = 'Qual data? Responda esta mensagem com DD/MM';
+const ASK_TEXT =
+  'Pular o check-in de quando?\n' +
+  'Abra o calendario ou digite DD/MM (ou um periodo: DD/MM-DD/MM).';
 const ASK_INITIATIVE = 'Qual a iniciativa padrao? Responda esta mensagem com o ID numerico (ex: 6)';
 const ASK_TIME = 'Qual horario do check-in automatico? Responda esta mensagem com HH:MM (ex: 09:30)';
 const SETUP_TTL_S = 600; // 10 minutos
+const SKIPS_TTL_S = 90 * 86400; // skips:<email> abandonado morre sozinho
 const REPOS_PAGE = 12; // repos por pagina no teclado do /repos
 const WD_PT = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'];
 const HELP =
   'Comandos:\n' +
-  '/pular — cancela o check-in automatico de um dia (pergunto a data)\n' +
+  '/pular — cancela o check-in automatico (abre o calendario)\n' +
   '/pular DD/MM — cancela direto para a data\n' +
-  '/retomar DD/MM — desfaz um cancelamento\n' +
+  '/pular DD/MM-DD/MM — cancela um periodo inteiro (so os dias uteis)\n' +
+  '/retomar — desfaz cancelamentos (abre o calendario)\n' +
   '/pulos — lista os cancelamentos agendados\n' +
   '/painel — resumo da sua configuracao do check-in automatico\n' +
   '/repos — ver e ajustar os repositorios no escopo da coleta\n' +
@@ -58,6 +72,7 @@ const HELP =
   '/testar — valida as credenciais salvas (Jira, Bitbucket, Lab, IA) sem enviar nada\n' +
   '/dryrun — gera o rascunho do check-in de hoje sem enviar\n' +
   '/agora — roda e envia o check-in agora\n' +
+  '/forcar — reenvia o check-in de hoje ignorando as guardas (use quando o envio falhou)\n' +
   '/aprovar on|off — revisar o rascunho no chat (botoes ✅/✏️) antes de enviar\n' +
   '/runner on|off — deixa o worker enviar seu check-in automaticamente (opt-in)';
 
@@ -78,11 +93,30 @@ export default {
 
     // /notify (Fase 5b) e /devlink (Fase 1C): chamadas dos runners/extensao,
     // nao do Telegram. Autenticacao propria (segredo / bot token), com CORS.
+    // Mini App do /pular: GET serve a pagina, POST recebe a selecao. Autentica
+    // pelo initData (HMAC do bot token), nao pelo header do webhook.
+    if (url.pathname === '/picker') {
+      try {
+        return await handlePicker(request, url, env);
+      } catch (e) {
+        console.error('erro no /picker', e);
+        return jsonCors({ ok: false, error: 'internal' }, 500);
+      }
+    }
+
     if (url.pathname === '/notify') {
       try {
         return await handleNotify(request, env);
       } catch (e) {
         console.error('erro no /notify', e);
+        return jsonCors({ ok: false, error: 'internal' }, 500);
+      }
+    }
+    if (url.pathname === '/skips') {
+      try {
+        return await handleSkips(request, url, env);
+      } catch (e) {
+        console.error('erro no /skips', e);
         return jsonCors({ ok: false, error: 'internal' }, 500);
       }
     }
@@ -117,6 +151,7 @@ export default {
   // /runner. Inerte enquanto ninguem optou. Ver wrangler.toml [triggers].
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runnerCron(env));
+    ctx.waitUntil(watchdogCron(env));
   },
 };
 
@@ -191,8 +226,9 @@ function fmt(iso) {
   return `${d}/${m} (${WD_PT[weekday(iso)]})`;
 }
 
-/** Aceita: hoje, amanha, DD/MM, DD/MM/AAAA, AAAA-MM-DD. Retorna ISO ou null. */
-function parseDate(raw) {
+/** Aceita: hoje, amanha, DD/MM, DD/MM/AAAA, AAAA-MM-DD. Retorna ISO ou null.
+ *  `roll`: DD/MM sem ano que ja passou vai para o ano seguinte (data avulsa). */
+function parseDate(raw, roll = true) {
   const s = raw.trim().toLowerCase().replace('amanhã', 'amanha');
   const today = todayIso();
   if (s === 'hoje') return today;
@@ -205,8 +241,40 @@ function parseDate(raw) {
   const mon = m[2].padStart(2, '0');
   const year = m[3] ? (m[3].length === 2 ? '20' + m[3] : m[3]) : today.slice(0, 4);
   let iso = validIso(`${year}-${mon}-${day}`);
-  if (iso && !m[3] && iso < today) iso = validIso(`${Number(year) + 1}-${mon}-${day}`);
+  if (roll && iso && !m[3] && iso < today) iso = nextYear(iso);
   return iso;
+}
+
+function nextYear(iso) {
+  return validIso(`${Number(iso.slice(0, 4)) + 1}${iso.slice(4)}`);
+}
+
+/** Data unica ou periodo ("21/07-25/07", "21/07 a 25/07"). Retorna [] se invalido.
+ *  Periodo ja comecado vale de hoje em diante (/retomar no meio das ferias). */
+function parseDates(raw) {
+  const one = parseDate(raw);
+  if (one) return [one];
+  const s = raw.trim().toLowerCase();
+  const today = todayIso();
+  // Tenta cada separador possivel: o primeiro "a" de "amanha", ou o "-" de uma
+  // data ISO, nao podem ser lidos como separador.
+  for (const m of s.matchAll(/\s+(?:at[eé]|a)\s+|\s*(?:-|–|\.\.)\s*/g)) {
+    const a = s.slice(0, m.index);
+    const b = s.slice(m.index + m[0].length);
+    const semAno = ![a, b].some((x) => /^\d{4}-|\/\d{1,2}\/\d{2,4}$/.test(x.trim()));
+    let from = parseDate(a, false);
+    let to = parseDate(b, false);
+    if (!from || !to) continue;
+    if (semAno && to < from) to = nextYear(to); // 28/12-03/01
+    if (semAno && to && to < today) [from, to] = [nextYear(from), nextYear(to)];
+    if (!from || !to || to < from) return [];
+    if (addDays(from, 91) <= to) return []; // periodo absurdo: trata como nao entendido
+    if (from < today) from = today;
+    const out = [];
+    for (let d = from; d <= to; d = addDays(d, 1)) out.push(d);
+    return out;
+  }
+  return [];
 }
 
 // --- mensagem fixada com as datas de skip (sempre no chat de origem) ----------
@@ -248,54 +316,65 @@ async function writeSkips(env, chatId, pm, dates) {
 
 // --- comandos de skip ----------------------------------------------------------
 
-async function doPular(env, chatId, iso) {
-  if (!iso) {
-    await send(env, chatId, 'Nao entendi a data. Manda DD/MM (ex: 21/07), "hoje" ou "amanha".');
+async function doPular(env, chatId, isos) {
+  if (!isos || !isos.length) {
+    await send(env, chatId, 'Nao entendi a data. Manda DD/MM (ex: 21/07), um periodo (ex: 21/07-25/07), "hoje" ou "amanha".');
     return;
   }
-  if (iso < todayIso()) {
-    await send(env, chatId, `${fmt(iso)} ja passou — nada a cancelar.`);
-    return;
-  }
-  if (weekday(iso) === 0 || weekday(iso) === 6) {
-    await send(env, chatId, `${fmt(iso)} e fim de semana — o check-in nem roda nesse dia, nada a cancelar.`);
+  const today = todayIso();
+  const uteis = isos.filter((iso) => iso >= today && weekday(iso) !== 0 && weekday(iso) !== 6);
+  if (!uteis.length) {
+    if (isos.length > 1) await send(env, chatId, 'Nenhum dia util no periodo — nada a cancelar.');
+    else if (isos[0] < today) await send(env, chatId, `${fmt(isos[0])} ja passou — nada a cancelar.`);
+    else await send(env, chatId, `${fmt(isos[0])} e fim de semana — o check-in nem roda nesse dia, nada a cancelar.`);
     return;
   }
   const { pm, dates } = await getSkips(env, chatId);
-  if (dates.includes(iso)) {
-    await send(env, chatId, `O check-in de ${fmt(iso)} ja estava cancelado.`);
+  const novos = uteis.filter((iso) => !dates.includes(iso));
+  if (!novos.length) {
+    await send(env, chatId, uteis.length === 1
+      ? `O check-in de ${fmt(uteis[0])} ja estava cancelado.`
+      : 'Todos os dias uteis desse periodo ja estavam cancelados.');
     return;
   }
-  await writeSkips(env, chatId, pm, [...dates, iso]);
-  const [, m, d] = iso.split('-');
-  await send(env, chatId, `🚫 Fechado! Vou pular o check-in de ${fmt(iso)}. Pra desfazer: /retomar ${d}/${m}`);
+  await writeSkips(env, chatId, pm, [...dates, ...novos]);
+  const [, m, d] = novos[0].split('-');
+  await send(env, chatId, novos.length === 1
+    ? `🚫 Fechado! Vou pular o check-in de ${fmt(novos[0])}. Pra desfazer: /retomar ${d}/${m}`
+    : `🚫 Fechado! Vou pular ${novos.length} check-ins: ${novos.map(fmt).join(', ')}.\nPra desfazer: /retomar ${d}/${m}-${novos[novos.length - 1].split('-')[2]}/${novos[novos.length - 1].split('-')[1]}`);
 }
 
-async function doRetomar(env, chatId, arg) {
+async function doRetomar(env, chatId, arg, origin) {
   const { pm, dates } = await getSkips(env, chatId);
   if (!dates.length) {
     await send(env, chatId, 'Nao ha nenhum cancelamento agendado.');
     return;
   }
-  let iso;
+  let alvo;
   if (arg) {
-    iso = parseDate(arg);
-    if (!iso) {
-      await send(env, chatId, 'Nao entendi a data. Ex: /retomar 21/07');
+    alvo = parseDates(arg);
+    if (!alvo.length) {
+      await send(env, chatId, 'Nao entendi a data. Ex: /retomar 21/07 (ou um periodo: 21/07-25/07)');
       return;
     }
-  } else if (dates.length === 1) {
-    iso = dates[0];
   } else {
-    await send(env, chatId, 'Ha mais de um cancelamento agendado: ' + dates.map(fmt).join(', ') + '. Especifique: /retomar DD/MM');
+    // Sem data: o calendario mostra so o que esta agendado, e cada toque e um
+    // dia que volta a rodar.
+    await send(env, chatId, 'Agendados: ' + dates.map(fmt).join(', ') +
+      '\n\nEscolha no calendario ou digite: /retomar DD/MM (ou DD/MM-DD/MM).', {
+      inline_keyboard: [[{ text: '📅 Escolher no calendario', web_app: { url: `${origin}/picker?m=retomar` } }]],
+    });
     return;
   }
-  if (!dates.includes(iso)) {
-    await send(env, chatId, `${fmt(iso)} nao estava cancelado. Agendados: ` + dates.map(fmt).join(', '));
+  const remover = alvo.filter((iso) => dates.includes(iso));
+  if (!remover.length) {
+    await send(env, chatId, (alvo.length === 1 ? `${fmt(alvo[0])} nao estava cancelado.` : 'Nenhuma data desse periodo estava cancelada.') + ' Agendados: ' + dates.map(fmt).join(', '));
     return;
   }
-  await writeSkips(env, chatId, pm, dates.filter((d) => d !== iso));
-  await send(env, chatId, `✅ Cancelamento desfeito — o check-in de ${fmt(iso)} volta a ser enviado normalmente.`);
+  await writeSkips(env, chatId, pm, dates.filter((iso) => !remover.includes(iso)));
+  await send(env, chatId, remover.length === 1
+    ? `✅ Cancelamento desfeito — o check-in de ${fmt(remover[0])} volta a ser enviado normalmente.`
+    : `✅ ${remover.length} cancelamentos desfeitos (${remover.map(fmt).join(', ')}) — os check-ins voltam a ser enviados normalmente.`);
 }
 
 async function doPulos(env, chatId) {
@@ -306,14 +385,223 @@ async function doPulos(env, chatId) {
   else await send(env, chatId, 'Check-ins cancelados: ' + future.map(fmt).join(', '));
 }
 
-function askDate(env, chatId) {
-  return send(env, chatId, 'Pular o check-in de quando?', {
+/** Marca/limpa "estou esperando uma data" — o ForceReply sozinho nao basta:
+ *  se o dev digita a data como mensagem nova, o reply_to_message nao vem. */
+async function setPendingPular(env, chatId, user, on = true) {
+  if (!user) return;
+  user.prefs = user.prefs || {};
+  if (on) {
+    if (user.prefs._pending) return; // cadastro em andamento: nao atropela a etapa
+    user.prefs._pending = 'pular';
+  }
+  else if (user.prefs._pending === 'pular') delete user.prefs._pending;
+  else return;
+  await putUser(env, chatId, user);
+}
+
+// --- calendario: Mini App com Air Datepicker -------------------------------------
+// O teclado inline de botoes foi trocado por um Mini App (webview): uma pagina
+// nossa numa rota do Worker, com o Air Datepicker (MIT) em `multipleDates`.
+// Selecao real, celula desabilitada de verdade, mes em pt-BR e cores do tema do
+// Telegram — nada disso um inline_keyboard entrega.
+//
+// Entrada: botao `web_app` na mensagem do /pular (nao `KeyboardButton`, que
+// trocaria o teclado do usuario). Como `sendData()` so existe em KeyboardButton,
+// o retorno vem por POST na propria rota, autenticado pelo `initData` (HMAC do
+// bot token) — que tambem e de onde sai o chat_id.
+//
+// Cliente antigo ou de terceiro nao abre Mini App: `/pular DD/MM` (e o periodo
+// DD/MM-DD/MM) continua sendo a saida, e e o que os testes cobrem.
+
+// ponytail: Air Datepicker vem do jsdelivr, nao vendorizado (seriam ~70KB no
+// repo + regra Text no wrangler.toml + uma nota de como atualizar). Se o CDN
+// virar problema, vendorize — o resto da pagina nao muda.
+const ADP = 'https://cdn.jsdelivr.net/npm/air-datepicker@3.6.0/air-datepicker';
+
+/** Dia em que o check-in nao roda — logo, nao ha o que pular. */
+function calBlocked(iso) {
+  if (iso < todayIso()) return 'ja passou';
+  const wd = weekday(iso);
+  return wd === 0 || wd === 6 ? 'e fim de semana — o check-in nao roda' : '';
+}
+
+/** A selecao E o estado final desejado: grava uma vez e conta o diff.
+ *  Uma escrita so — doPular + doRetomar em sequencia dariam dois writeSkips. */
+async function calConfirm(env, chatId, sel) {
+  const { pm, dates } = await getSkips(env, chatId);
+  const atuais = dates.filter((d) => !calBlocked(d));
+  const add = sel.filter((d) => !atuais.includes(d));
+  const rem = atuais.filter((d) => !sel.includes(d));
+  if (!add.length && !rem.length) {
+    await send(env, chatId, 'Nada mudou — a lista de pulos continua a mesma.');
+    return;
+  }
+  await writeSkips(env, chatId, pm, sel);
+  const partes = [];
+  if (add.length) partes.push(`🚫 Vou pular: ${add.map(fmt).join(', ')}`);
+  if (rem.length) partes.push(`✅ Volta a rodar: ${rem.map(fmt).join(', ')}`);
+  await send(env, chatId, partes.join('\n') + '\n\nPra mexer de novo: /pular');
+}
+
+async function hmacSha256(key, msg) {
+  const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg)));
+}
+
+/** Valida o initData do Mini App (receita da doc do Telegram) e devolve o
+ *  chat_id. Sem isso a rota seria um /pular aberto para qualquer um. */
+async function initDataChatId(env, initData) {
+  const p = new URLSearchParams(initData || '');
+  const hash = p.get('hash');
+  if (!hash) return null;
+  p.delete('hash');
+  const check = [...p].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join('\n');
+  const secret = await hmacSha256(new TextEncoder().encode('WebAppData'), env.BOT_TOKEN);
+  const sig = [...(await hmacSha256(secret, check))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  if (sig !== hash) return null;
+  if (Date.now() / 1000 - Number(p.get('auth_date') || 0) > 86400) return null; // initData velho
+  try {
+    return JSON.parse(p.get('user')).id;
+  } catch {
+    return null;
+  }
+}
+
+/** GET: a pagina (`?m=retomar` abre o modo retomar). POST sem `dates`: o estado
+ *  atual. POST com `dates`: aplica.
+ *
+ *  Cada modo so anda para um lado — pular soma, retomar subtrai. Um calendario
+ *  que fizesse as duas coisas de uma vez ja existiu aqui e confundia: nao dava
+ *  para saber se desmarcar era "nao quero mais pular" ou "nunca quis". */
+async function handlePicker(request, url, env) {
+  if (request.method !== 'POST') return pickerPage(url.searchParams.get('m') === 'retomar');
+  const body = await request.json().catch(() => ({}));
+  const chatId = await initDataChatId(env, body.initData);
+  if (!chatId) return jsonCors({ ok: false, error: 'sessao invalida — reabra pelo bot' }, 403);
+  const { dates } = await getSkips(env, chatId);
+  const agendados = dates.filter((d) => !calBlocked(d));
+  if (!Array.isArray(body.dates)) return jsonCors({ ok: true, today: todayIso(), dates: agendados });
+  const sel = body.dates.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && !calBlocked(d));
+  const retomar = body.mode === 'retomar';
+  const final = retomar
+    ? agendados.filter((d) => !sel.includes(d))
+    : [...new Set([...agendados, ...sel])].sort();
+  await calConfirm(env, chatId, final);
+  // A data veio pelo calendario: o proximo texto livre nao e mais uma data.
+  await setPendingPular(env, chatId, chatId === adminId(env) ? await ensureAdminUser(env) : await getUser(env, chatId), false);
+  return jsonCors({ ok: true });
+}
+
+function pickerPage(retomar) {
+  const t = retomar
+    ? { titulo: 'Retomar check-in', instr: 'Toque nos dias agendados que devem voltar a rodar.',
+        botao: 'Retomar', leg: [['agendado', 'Agendado'], ['novo', 'Volta a rodar']] }
+    : { titulo: 'Pular check-in', instr: 'Toque nos dias em que o check-in NAO deve rodar.',
+        botao: 'Confirmar', leg: [['novo', 'Escolhido agora'], ['agendado', 'Ja agendado']] };
+  return new Response(
+    `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>${t.titulo}</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="${ADP}.css">
+<style>
+ body{margin:0;padding:14px;font:16px/1.45 system-ui,sans-serif;
+      background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#222)}
+ p{margin:0 0 12px;font-size:.85rem;color:var(--tg-theme-hint-color,#777)}
+ #erro{color:#d33}
+ /* Cor do "ja agendado": laranja fixo, legivel nos dois temas. O azul (ou o que
+    a pessoa tiver de button_color) fica para o que ela esta escolhendo agora. */
+ :root{--cor-agendado:#e08a1e}
+ /* O quadro: calendario e legenda no mesmo cartao. */
+ #quadro{border:1px solid var(--tg-theme-hint-color,#ccc);border-radius:12px;padding:8px 8px 4px;
+         background:var(--tg-theme-secondary-bg-color,transparent)}
+ .legenda{display:flex;flex-wrap:wrap;gap:4px 16px;margin:2px 0 0;padding:8px 6px 6px;list-style:none;
+          border-top:1px solid var(--tg-theme-hint-color,#ddd);font-size:.78rem}
+ .legenda li{display:flex;align-items:center;gap:6px}
+ .legenda i{width:14px;height:14px;border-radius:4px;flex:0 0 auto}
+ .legenda .novo{background:var(--tg-theme-button-color,#2563eb)}
+ .legenda .agendado{background:var(--cor-agendado)}
+ /* Laranja = ja agendado; cor do tema = o que esta sendo escolhido agora. Serve
+    aos dois modos: no /pular o agendado vem desabilitado (so informa), no
+    /retomar e ele que se seleciona. Puro CSS sobre o -selected- que a lib mesma
+    liga e desliga, entao nao depende de re-render. */
+ .air-datepicker-cell.-day-.agendado{background:var(--cor-agendado);color:#fff}
+ .air-datepicker-cell.-day-.agendado.-selected-{background:var(--tg-theme-button-color,#2563eb)}
+ .air-datepicker{border:0;box-shadow:none;--adp-width:100%;
+   --adp-background-color:transparent;--adp-color:inherit;--adp-border-color-inner:transparent;
+   --adp-accent-color:var(--tg-theme-button-color,#2563eb);
+   --adp-cell-background-color-selected:var(--tg-theme-button-color,#2563eb);
+   --adp-cell-background-color-selected-hover:var(--tg-theme-button-color,#2563eb);
+   --adp-color-secondary:var(--tg-theme-hint-color,#999);
+   --adp-day-name-color:var(--tg-theme-hint-color,#777);
+   --adp-color-disabled:var(--tg-theme-hint-color,#bbb)}
+</style></head><body>
+<p>${t.instr}</p>
+<div id="quadro"><div id="cal"></div><ul class="legenda" id="legenda">
+${t.leg.map(([c, txt]) => ` <li><i class="${c}"></i>${txt}</li>`).join('\n')}
+</ul></div><p id="erro"></p>
+<script src="${ADP}.js"></script>
+<script>
+var tg = Telegram.WebApp; tg.ready(); tg.expand();
+var erro = document.getElementById('erro');
+var MODO = '${retomar ? 'retomar' : 'pular'}', RETOMAR = MODO === 'retomar';
+// AAAA-MM-DD das partes LOCAIS: Date.toISOString() converte para UTC e em fuso
+// positivo devolveria o dia anterior.
+function iso(d){ return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+var PT = {days:['Domingo','Segunda','Terca','Quarta','Quinta','Sexta','Sabado'],
+ daysShort:['Dom','Seg','Ter','Qua','Qui','Sex','Sab'],
+ daysMin:['Dom','Seg','Ter','Qua','Qui','Sex','Sab'],
+ months:['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'],
+ monthsShort:['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'],
+ today:'Hoje', clear:'Limpar', dateFormat:'dd/MM/yyyy', timeFormat:'HH:mm', firstDay:0};
+
+function post(body){
+  body.initData = tg.initData;
+  return fetch('/picker',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){ return r.json(); })
+    .then(function(r){ if(!r.ok) throw new Error(r.error || 'falhou'); return r; });
+}
+
+post({}).then(function(r){
+  function rotulo(n){ tg.MainButton.setText('${t.botao} (' + n + ')').show(); }
+  // Cada modo abre com nada marcado e so anda para um lado: no /pular o agendado
+  // fica desabilitado (informa, nao se mexe); no /retomar so ele e clicavel.
+  var dp = new AirDatepicker('#cal', {
+    inline:true, locale:PT, multipleDates:true, firstDay:0,
+    // minDate vem do servidor (fuso de Sao Paulo), nao do relogio do aparelho.
+    minDate:new Date(r.today + 'T00:00:00'),
+    onRenderCell:function(o){
+      if (o.cellType !== 'day') return {};
+      var wd = o.date.getDay();
+      if (wd === 0 || wd === 6) return {disabled:true};
+      var agendado = r.dates.indexOf(iso(o.date)) >= 0;
+      if (agendado) return {classes:'agendado', disabled:RETOMAR ? false : true};
+      return RETOMAR ? {disabled:true} : {};
+    },
+    onSelect:function(o){ rotulo(o.datepicker.selectedDates.length); },
+  });
+  rotulo(0);
+  tg.MainButton.onClick(function(){
+    tg.MainButton.showProgress();
+    post({mode:MODO, dates: dp.selectedDates.map(iso)})
+      .then(function(){ tg.close(); })
+      .catch(function(e){ tg.MainButton.hideProgress(); erro.textContent = e.message; });
+  });
+}).catch(function(e){ erro.textContent = 'Nao deu para abrir o calendario: ' + e.message; });
+</script></body></html>`,
+    { headers: { 'content-type': 'text/html; charset=utf-8' } }
+  );
+}
+
+async function askDate(env, chatId, user, origin) {
+  await setPendingPular(env, chatId, user);
+  return send(env, chatId, ASK_TEXT, {
     inline_keyboard: [
       [
         { text: 'Hoje', callback_data: 'pular:hoje' },
         { text: 'Amanha', callback_data: 'pular:amanha' },
-        { text: 'Outra data', callback_data: 'pular:outra' },
       ],
+      [{ text: '📅 Escolher no calendario', web_app: { url: `${origin}/picker` } }],
     ],
   });
 }
@@ -786,6 +1074,23 @@ function emailAllowed(email, domains) {
   return allow.includes(m[1]);
 }
 
+// Escolhe o canal do dev e entrega: e-mail quando ele tem um (o do corpo do
+// /notify, senao prefs.email do KV), Telegram como alternativa. E o UNICO lugar
+// que decide isso — o runnerCron chamava send() direto e furava o prefs.email de
+// quem escolheu e-mail, mandando o ❌ para um canal que a pessoa nao le.
+async function deliver(env, chatId, text, askedEmail = '') {
+  const user = chatId ? await getUser(env, chatId) : null;
+  const email = askedEmail || user?.prefs?.email || '';
+  let delivered = false;
+  if (email) {
+    // Entrega NAO arma o watchdog: runner do worker e cron local tambem passam
+    // aqui e nao mandam heartbeat — so a rotina da nuvem (heartbeat) e cobrada.
+    delivered = await sendEmail(env, email, 'Auto Check-in', text);
+  }
+  if (!delivered && chatId) delivered = !!(await send(env, chatId, text)).ok;
+  return { delivered, email };
+}
+
 // POST /notify — { chatId, text } ou { email, text } (ou os dois). Com chatId o
 // worker resolve o canal do dev pelo KV (e-mail de prefs.email se houver,
 // Telegram caso contrario); com email no corpo entrega direto por Resend, que e
@@ -806,21 +1111,22 @@ async function handleNotify(request, env) {
   const chatId = Number(body.chatId) || 0;
   const text = (body.text || '').toString();
   const asked = (body.email || '').toString().trim();
-  if ((!chatId && !asked) || !text) {
-    return jsonCors({ ok: false, error: 'chatId ou email, mais text, sao obrigatorios' }, 400);
-  }
   if (asked && !emailAllowed(asked, env.NOTIFY_EMAIL_DOMAINS)) {
     return jsonCors({ ok: false, error: 'dominio de e-mail nao liberado em NOTIFY_EMAIL_DOMAINS' }, 403);
   }
-
-  let delivered = false;
-  const user = chatId ? await getUser(env, chatId) : null;
-  const email = asked || user?.prefs?.email;
-  if (email) delivered = await sendEmail(env, email, 'Auto Check-in', text);
-  if (!delivered && chatId) {
-    const r = await send(env, chatId, text);
-    delivered = !!r.ok;
+  // { email, heartbeat: true } — sinal de vida da rotina do claude.ai, sem
+  // entregar nada. E o que separa "a rotina nao rodou" de "nao tinha o que
+  // dizer": sem ele os dois sao o mesmo silencio. Ver watchdogCron.
+  if (body.heartbeat === true) {
+    if (!asked) return jsonCors({ ok: false, error: 'heartbeat exige email' }, 400);
+    await touchWatch(env, asked);
+    return jsonCors({ ok: true, heartbeat: true });
   }
+  if ((!chatId && !asked) || !text) {
+    return jsonCors({ ok: false, error: 'chatId ou email, mais text, sao obrigatorios' }, 400);
+  }
+
+  const { delivered, email } = await deliver(env, chatId, text, asked);
   // 200 com ok:false passava batido no `curl -sf` do checkin.sh (fallback nunca
   // rodava): falha de entrega precisa ser status de erro.
   if (!delivered) {
@@ -828,6 +1134,66 @@ async function handleNotify(request, env) {
     return jsonCors({ ok: false, error: why }, 502);
   }
   return jsonCors({ ok: true });
+}
+
+// --- /skips: pular dias sem Telegram (KV skips:<email>) -----------------------
+// O estado do /pular vive na MENSAGEM FIXADA do chat com o bot — quem escolheu
+// e-mail nao tem chat, e por isso a guarda de skip saia inteira do roteiro
+// dele: rotina na nuvem sem nenhuma forma de pular um dia. Aqui o mesmo estado
+// mora no KV, chaveado pelo e-mail (mesma identidade que o watchdog usa), e o
+// `checkin.sh pular` espelha para ca.
+//
+// Auth igual a do /notify: NOTIFY_SECRET + dominio na allowlist. O segredo e
+// compartilhado no time — sem a checagem de dominio um dev pularia o check-in
+// de outro (ou de um endereco inventado, enchendo o KV).
+//   GET  ?email=...        -> { ok, today, dates }
+//   POST { email, dates }  -> { ok, today, dates }   (a lista E o estado final)
+async function handleSkips(request, url, env) {
+  if (request.method === 'OPTIONS') return corsPreflight();
+  if (request.method !== 'GET' && request.method !== 'POST') {
+    return jsonCors({ ok: false, error: 'method not allowed' }, 405);
+  }
+  if (!env.NOTIFY_SECRET || request.headers.get('x-notify-secret') !== env.NOTIFY_SECRET) {
+    return jsonCors({ ok: false, error: 'forbidden' }, 403);
+  }
+  let email = (url.searchParams.get('email') || '').toString().trim();
+  let dates = null;
+  if (request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    if (body.email) email = body.email.toString().trim();
+    if (Array.isArray(body.dates)) dates = body.dates;
+  }
+  if (!emailAllowed(email, env.NOTIFY_EMAIL_DOMAINS)) {
+    return jsonCors({ ok: false, error: 'email ausente ou dominio nao liberado em NOTIFY_EMAIL_DOMAINS' }, 403);
+  }
+  const final = dates ? await writeEmailSkips(env, email, dates) : await readEmailSkips(env, email);
+  return jsonCors({ ok: true, today: todayIso(), dates: final });
+}
+
+function skipsKey(email) {
+  return `skips:${email.trim().toLowerCase()}`;
+}
+
+async function readEmailSkips(env, email, today = todayIso()) {
+  let dates;
+  try {
+    dates = JSON.parse((await env.USERS.get(skipsKey(email))) || '[]');
+  } catch {
+    dates = [];
+  }
+  if (!Array.isArray(dates)) return [];
+  return [...new Set(dates)].filter((d) => validIso(d) && d >= today).sort();
+}
+
+/** A lista E o estado final desejado (mesmo contrato do calendario do Mini App).
+ *  Guarda so dia util no futuro: passado nao tem o que pular e fim de semana a
+ *  rotina nem roda — assim o retorno mostra ao dev o que de fato ficou valendo. */
+async function writeEmailSkips(env, email, dates) {
+  const final = [...new Set(dates.map((d) => String(d)))].filter((d) => validIso(d) && !calBlocked(d)).sort();
+  const key = skipsKey(email);
+  if (!final.length) await env.USERS.delete(key);
+  else await env.USERS.put(key, JSON.stringify(final), { expirationTtl: SKIPS_TTL_S });
+  return final;
 }
 
 // /devlink — deep linking com a extensao (Fase 1C).
@@ -1558,6 +1924,18 @@ function submitFailureDetail(props, payload, status) {
       : '');
 }
 
+/** O Lab pode simplesmente NAO pedir check-in num dia util: props.cards vem vazio
+ *  e props.semConvocacao diz o porque (janela fechada, modulo concluido, versao
+ *  encerrada). Nao e falha e reenviar nao muda nada — devolve o motivo, ou ''
+ *  (props ausente fica permissivo, como as demais guardas por-iniciativa). */
+function noConvocacao(props) {
+  const p = props?.props;
+  if (!p || !Array.isArray(p.cards) || p.cards.length) return '';
+  const sc = p.semConvocacao || {};
+  const mods = (sc.modulos || []).map((m) => `${m.nome} (${m.motivo})`).join('; ');
+  return `${sc.motivo || 'sem convocacao'} — ${mods || 'sem detalhe'}`;
+}
+
 function labIsSubmitted(props, initId) {
   const cards = props?.props?.cards || [];
   return cards.some((c) => Number(c.initiativeId) === Number(initId) && c.existing);
@@ -1692,6 +2070,9 @@ async function runCheckin(env, chatId, { dryRun = false, force = false, approve 
   const session = await labSession(secrets);
   if (!session.ok) return `❌ ${labSessionError(session)}`;
 
+  const semConv = noConvocacao(session.props);
+  if (semConv) return `ℹ️ O Lab nao pediu check-in hoje: ${semConv}. Se isso estiver errado, fale com o admin do Lab.`;
+
   const results = [];
   if (warnings.length) results.push('⚠️ ' + warnings.join(' | '));
   for (const c of checkins) {
@@ -1702,6 +2083,7 @@ async function runCheckin(env, chatId, { dryRun = false, force = false, approve 
     const r = await labSubmit(session, { initiative: c.initiative, date: t, yesterday: c.yesterday, today: c.today });
     results.push(r.ok ? `✅ Iniciativa ${c.initiative} enviada (HTTP ${r.status}).` : `❌ Iniciativa ${c.initiative}: ${r.error || `HTTP ${r.status}`}.`);
   }
+  if (results.some((l) => l.startsWith('❌'))) results.push('Quando o Lab voltar, tente de novo com /forcar.');
   return results.join('\n');
 }
 
@@ -1858,6 +2240,15 @@ async function doAgora(env, chatId) {
   if (out) await send(env, chatId, out); // vazio = virou rascunho para aprovar
 }
 
+// Recuperacao de falha (Lab fora do ar, form sem modal, cookie renovado): roda
+// com force, ou seja, sem as guardas de fim de semana/feriado/pular e sem passar
+// pela aprovacao. A guarda de "ja preenchida" continua valendo — ela e o que
+// impede um check-in duplicado no card.
+async function doForcar(env, chatId) {
+  await send(env, chatId, 'Forcando o check-in (ignora horario, fim de semana, feriado e /pular; envia sem pedir aprovacao)...');
+  await send(env, chatId, await runCheckin(env, chatId, { force: true }));
+}
+
 // --- Cron Trigger: roda para cada usuario active que optou pelo runner -----------
 
 function scheduleGate(prefs) {
@@ -1865,6 +2256,122 @@ function scheduleGate(prefs) {
   if (!time) return true;
   const now = new Intl.DateTimeFormat('en-GB', { timeZone: SP_TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
   return now >= time;
+}
+
+// --- watchdog do modo nuvem (dead-man's switch) ------------------------------
+// A rotina do claude.ai avisa quando FALHA, mas nao tem como avisar quando nao
+// roda — pausada, sem credito, ou morta antes de chegar no bloco Notificar. Os
+// tres casos sao silencio, e silencio e indistinguivel de "dia sem novidade".
+// Por isso a rotina pinga /notify com heartbeat:true em TODO desfecho (inclusive
+// quando para nas guardas), e o tick do fim do dia cobra quem nao pingou.
+// Registro: watch:<email> = { email, last, alerted }. Nasce sozinho no primeiro
+// heartbeat e morre de TTL 30 dias depois
+// do ultimo sinal de vida — rotina abandonada para de cobrar sozinha.
+// ponytail: cobranca num horario fixo para todo mundo; se alguem agendar a
+// rotina depois das 18h SP, o jeito e um horario por dev no registro.
+const WATCHDOG_HOUR = 18;
+const WATCH_TTL_DAYS = 30;
+
+function spHour() {
+  return Number(
+    new Intl.DateTimeFormat('en-GB', { timeZone: SP_TZ, hour: '2-digit', hour12: false }).format(new Date())
+  );
+}
+
+function watchKey(email) {
+  return `watch:${email.trim().toLowerCase()}`;
+}
+
+// TTL contado a partir do ultimo sinal de vida, nao da ultima escrita: senao o
+// marcador `alerted` renovaria os 30 dias todo dia e a cobranca seria eterna.
+function watchTtl(lastIso, todayIso_) {
+  const days = Math.floor((Date.parse(todayIso_) - Date.parse(lastIso)) / 86400000);
+  return Math.max(3600, (WATCH_TTL_DAYS - days) * 86400);
+}
+
+async function touchWatch(env, email) {
+  const today = todayIso();
+  await env.USERS.put(watchKey(email), JSON.stringify({ email: email.trim(), last: today }), {
+    expirationTtl: watchTtl(today, today),
+  });
+}
+
+const WATCHDOG_TEXT = (today) =>
+  `Sua rotina do lab-checkin nao deu sinal de vida hoje (${today}).\n\n` +
+  'Nenhum check-in foi enviado e nenhum erro chegou — os dois sao silencio, entao ' +
+  'o mais provavel e que a rotina nao tenha executado (pausada, sem credito) ou ' +
+  'tenha morrido antes de conseguir avisar.\n\n' +
+  'O que fazer agora:\n' +
+  '1. Preencha o check-in de hoje na mao: https://lab.idealtrends.io/saude-entrega/daily\n' +
+  '2. Abra o historico de execucoes da rotina no claude.ai e veja o que aconteceu.\n' +
+  '3. Se o cookie do Lab expirou: logue no Lab, exporte o config.json na extensao ' +
+  'e rode /setup-checkin de novo.';
+
+// email -> chat_id de quem tem prefs.email, para o watchdog enxergar tambem o
+// /pular do bot (mensagem fixada), e nao so o skip do `checkin.sh pular`.
+async function chatsByEmail(env) {
+  const map = new Map();
+  let cursor;
+  do {
+    const list = await env.USERS.list({ prefix: 'user:', cursor });
+    cursor = list.list_complete ? undefined : list.cursor;
+    for (const k of list.keys) {
+      const u = await getUser(env, Number(k.name.slice('user:'.length)));
+      const e = (u?.prefs?.email || '').trim().toLowerCase();
+      if (e) map.set(e, Number(k.name.slice('user:'.length)));
+    }
+  } while (cursor);
+  return map;
+}
+
+async function pinnedSkipToday(env, chatId, today) {
+  if (!chatId) return false;
+  try {
+    return (await getSkips(env, chatId)).dates.includes(today);
+  } catch {
+    return false; // Telegram fora: cobra, como antes
+  }
+}
+
+// `hour` e `today` sao parametros so para o teste conseguir fixar o relogio.
+async function watchdogCron(env, hour = spHour(), today = todayIso()) {
+  // So no fim do dia: mais cedo, a rotina de quem roda de tarde ainda nao rodou
+  // e a cobranca seria falso alarme. O marcador `alerted` faz o resto dos ticks
+  // do dia serem inertes — um e-mail por dia, nao um por tick.
+  if (hour < WATCHDOG_HOUR) return;
+  // Dia em que nao havia check-in a fazer nao se cobra: silencio em fim de
+  // semana e feriado e o comportamento correto, nao rotina morta. (Skip do dev:
+  // por e-mail, logo abaixo — depende de quem e o dono do registro.)
+  const wd = weekday(today);
+  if (wd === 0 || wd === 6) return;
+  if (await isHolidayIso(today)) return;
+  let chats; // so lista os usuarios se houver alguem para cobrar
+  let cursor;
+  do {
+    const list = await env.USERS.list({ prefix: 'watch:', cursor });
+    cursor = list.list_complete ? undefined : list.cursor;
+    for (const k of list.keys) {
+      const raw = await env.USERS.get(k.name);
+      if (!raw) continue;
+      let w;
+      try {
+        w = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      if (!w.email || w.last === today || w.alerted === today) continue;
+      if ((await readEmailSkips(env, w.email, today)).includes(today)) continue; // dia que o dev pulou
+      if (await pinnedSkipToday(env, (chats ??= await chatsByEmail(env)).get(w.email.trim().toLowerCase()), today)) continue; // /pular do bot
+      const sent = await sendEmail(env, w.email, 'Auto Check-in — a rotina nao rodou hoje', WATCHDOG_TEXT(today));
+      if (!sent) {
+        console.error('watchdog: e-mail nao entregue', w.email);
+        continue; // sem marcar: tenta de novo no proximo tick
+      }
+      await env.USERS.put(k.name, JSON.stringify({ ...w, alerted: today }), {
+        expirationTtl: watchTtl(w.last || today, today),
+      });
+    }
+  } while (cursor);
 }
 
 async function runnerCron(env) {
@@ -1883,17 +2390,17 @@ async function runnerCron(env) {
         const out = await runCheckin(env, chatId, { approve: !!user.prefs?.approve });
         // Notifica so quando algo aconteceu de verdade (envio ✅ ou erro ❌);
         // silencia "ja preenchida"/fim de semana/feriado/pular para evitar ruido.
-        if (/[✅❌]/.test(out)) await send(env, chatId, out);
+        if (/[✅❌]/.test(out)) await deliver(env, chatId, out);
       } catch (e) {
         console.error('runnerCron', chatId, e);
-        await send(env, chatId, '❌ Erro no check-in automatico do worker: ' + String(e).slice(0, 200));
+        await deliver(env, chatId, '❌ Erro no check-in automatico do worker: ' + String(e).slice(0, 200));
       }
     }
   } while (cursor);
 }
 
 // exporta para uso futuro / test_draft.mjs
-export { decryptJson, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, submitFailureDetail, emailAllowed };
+export { decryptJson, parseDates, calBlocked, initDataChatId, pickerPage, genPrompt, draftText, putDraft, getDraft, todayIso, parseDataPage, labIsSubmitted, noConvocacao, submitFailureDetail, emailAllowed, handleSkips, skipsKey, readEmailSkips, writeEmailSkips, watchKey, watchTtl, watchdogCron, WATCH_TTL_DAYS, deliver };
 
 // --- roteamento -----------------------------------------------------------------
 
@@ -1934,8 +2441,8 @@ async function handle(update, env, origin) {
       return;
     }
     if (cmd === 'pular') {
-      if (arg === 'outra') await send(env, chatId, ASK_TEXT, { force_reply: true });
-      else await doPular(env, chatId, parseDate(arg));
+      await setPendingPular(env, chatId, user, false);
+      await doPular(env, chatId, parseDates(arg));
     }
     return;
   }
@@ -1963,10 +2470,14 @@ async function handle(update, env, origin) {
 
   if (low.startsWith('/pular')) {
     const arg = text.slice('/pular'.length).trim();
-    if (arg) await doPular(env, chatId, parseDate(arg));
-    else await askDate(env, chatId);
+    if (arg) {
+      await setPendingPular(env, chatId, user, false);
+      await doPular(env, chatId, parseDates(arg));
+    } else {
+      await askDate(env, chatId, user, origin);
+    }
   } else if (low.startsWith('/retomar')) {
-    await doRetomar(env, chatId, text.slice('/retomar'.length).trim());
+    await doRetomar(env, chatId, text.slice('/retomar'.length).trim(), origin);
   } else if (low.startsWith('/pulos')) {
     await doPulos(env, chatId);
   } else if (low.startsWith('/painel')) {
@@ -1981,16 +2492,21 @@ async function handle(update, env, origin) {
     await doDryrun(env, chatId);
   } else if (low.startsWith('/agora')) {
     await doAgora(env, chatId);
+  } else if (low.startsWith('/forcar') || low.startsWith('/forçar')) {
+    await doForcar(env, chatId);
   } else if (low.startsWith('/config')) {
     await doConfig(env, chatId, origin);
   } else if (low.startsWith('/testar')) {
     await doTestar(env, chatId);
   } else if (low.startsWith('/cancelar')) {
+    await setPendingPular(env, chatId, user, false);
     await send(env, chatId, 'Ok, deixa pra la.');
   } else if (msg.reply_to_message?.text?.startsWith('O que ajustar?')) {
     await regenDraft(env, chatId, text); // contexto do "✏️ Refazer"
-  } else if (msg.reply_to_message?.text?.startsWith('Qual data?')) {
-    await doPular(env, chatId, parseDate(text)); // resposta ao ForceReply de "Outra data"
+  } else if (user.prefs?._pending === 'pular') {
+    // data digitada logo apos o /pular, com ou sem reply
+    await setPendingPular(env, chatId, user, false);
+    await doPular(env, chatId, parseDates(text));
   } else if (msg.reply_to_message && (await handlePrefReply(env, chatId, user, msg))) {
     // resposta a uma pergunta de preferencia — ja tratada
   } else {

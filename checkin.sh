@@ -22,18 +22,25 @@
 #         --initiative ID     (padrao: 6 = Auditoria Ideal)
 #         --date YYYY-MM-DD   (padrao: hoje)
 #
-#   ./checkin.sh auto [--initiative ID] [--dry-run]
+#   ./checkin.sh auto [--initiative ID] [--dry-run] [--force]
 #       Preenche o check-in automaticamente buscando atividades do Jira/Bitbucket.
 #       Com initiative_config no config.json, roteia a atividade por iniciativa
 #       (project key do Jira / repo do Bitbucket) e faz um submit por iniciativa
 #       com atividade; o --initiative e a iniciativa padrao (atividade nao
 #       mapeada + dia sem atividade). Sem initiative_config, um unico submit.
 #       Respeita schedule.enabled/schedule.time do config.json (modelo tick).
+#       Dia resolvido fica gravado em .auto_state.json — enviado, pulado, fim de
+#       semana, feriado ou sem convocacao: a cron pode rodar mais de uma vez por
+#       dia (retentativa) que so a primeira gasta Jira/IA e so ela avisa.
+#       --force ignora horario, fim de semana, feriado, skip e .auto_state.json.
 #
 #   ./checkin.sh pular DD/MM      (ou hoje/amanha/YYYY-MM-DD)
-#       Cancela o check-in local de uma data (arquivo .skips.json), sem Telegram.
-#   ./checkin.sh retomar DD/MM    Desfaz um skip local.
-#   ./checkin.sh pulos            Lista os skips locais agendados.
+#       Cancela o check-in de uma data (arquivo .skips.json), sem Telegram. Com
+#       notify.url + notify.secret + notify.email no config.json, espelha no
+#       worker (KV skips:<email>) e a ROTINA DA NUVEM tambem pula o dia — e a
+#       alternativa ao /pular do bot para quem nao tem Telegram.
+#   ./checkin.sh retomar DD/MM    Desfaz um skip (local e na nuvem).
+#   ./checkin.sh pulos            Lista os skips agendados (e reenvia o espelho).
 #
 #   ./checkin.sh repos [PADRAO]
 #       Confirmacao (so leitura): lista os repos do workspace que casam com o
@@ -48,6 +55,11 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JAR="$DIR/cookies.txt"
 CONFIG="$DIR/config.json"
 SKIPS_FILE="$DIR/.skips.json"
+# Dia ja resolvido pelo `auto`: {"date": "YYYY-MM-DD", "motivo": "..."}. Escrito
+# no fim de um envio bem-sucedido E em todo desfecho que encerra o dia sem envio
+# (pulado, fim de semana, feriado, sem convocacao). Falha derruba o script antes
+# (exit 1 no cmd_submit), que e justamente o que deixa a retentativa acontecer.
+AUTO_STATE="$DIR/.auto_state.json"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
 # Só os comandos que falam com o Lab (status/submit/auto) exigem o cookie;
@@ -158,6 +170,22 @@ for c in p["cards"]:
 '
 }
 
+# O Lab pode simplesmente NAO pedir check-in num dia util: props.cards vem VAZIO
+# e props.semConvocacao explica o porque (janela fechada, modulo concluido, versao
+# encerrada). Nao e erro e nao adianta retentar — o estado e o mesmo o dia inteiro.
+# Imprime o motivo e sai 0 quando e esse o caso.
+no_convocacao() {
+    page_props | python3 -c '
+import json, sys
+p = json.load(sys.stdin)["props"]
+if p.get("cards"):
+    sys.exit(1)
+sc = p.get("semConvocacao") or {}
+mods = "; ".join(str(m.get("nome")) + " (" + str(m.get("motivo")) + ")" for m in (sc.get("modulos") or []))
+print((sc.get("motivo") or "sem convocacao") + " — " + (mods or "sem detalhe"))
+'
+}
+
 is_submitted() {
     local init_id="${1:-6}"
     page_props | python3 -c '
@@ -201,7 +229,8 @@ is_skipped() {
     # Respeita o /pular do bot: le a mensagem fixada do chat com o
     # @CheckInLabBot ("SKIP: YYYY-MM-DD, ...") via getChat. Mesmo contrato do
     # notify(): sem telegram no config.json, nao checa; falha na chamada nao
-    # bloqueia o check-in (mesma filosofia das rotinas cloud).
+    # bloqueia o check-in (mesma filosofia das rotinas cloud). Retorno: 0 =
+    # pulado, 1 = nao pulado, 2 = nao deu para ler o Telegram.
     local creds token chat_id pinned today
     [ -f "$CONFIG" ] || return 1
     creds="$(python3 -c '
@@ -225,10 +254,12 @@ except Exception:
 import json, sys
 try:
     r = json.load(sys.stdin)
-    print((r.get("result") or {}).get("pinned_message", {}).get("text", ""))
 except Exception:
-    pass
-')" || return 1
+    sys.exit(3)
+if r.get("ok") is not True:
+    sys.exit(3)
+print((r.get("result") or {}).get("pinned_message", {}).get("text", ""))
+')" || return 2
     today="$(date +%F)"
     case "$pinned" in
         *SKIP:*"$today"*) return 0 ;;
@@ -246,8 +277,31 @@ sys.exit(0 if auto_activity.is_holiday(today) else 1)
 "
 }
 
-# Skip LOCAL (arquivo .skips.json) — alternativa ao /pular do Telegram para
-# quem roda so no CLI/cron, sem depender do bot. Formato:
+# .auto_state.json = "o dia de hoje ja esta resolvido", com o motivo:
+#   {"date": "YYYY-MM-DD", "motivo": "enviado|pulado no bot|skip local|..."}
+# Enviado, pulado, fim de semana, feriado e "o Lab nao pediu" encerram o dia do
+# mesmo jeito — e e isso que faz as retentativas da cron sairem de graca e
+# CALADAS: nada de recoletar Jira/IA, nada de repetir o mesmo aviso a cada tick.
+# Imprime o motivo e devolve 0 quando o dia de hoje ja esta fechado.
+day_done() {
+    [ -f "$AUTO_STATE" ] || return 1
+    python3 -c '
+import json, sys, datetime
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if s.get("date") != datetime.date.today().isoformat():
+    sys.exit(1)
+print(s.get("motivo") or "ja enviado")
+' "$AUTO_STATE"
+}
+
+mark_day_done() { echo "{\"date\": \"$(date +%F)\", \"motivo\": \"$1\"}" > "$AUTO_STATE"; }
+
+# Skip LOCAL (arquivo .skips.json) — alternativa ao /pular do Telegram, sem
+# depender do bot; push_skips() espelha no worker para a rotina da nuvem ver o
+# mesmo estado. Formato:
 #   {"skips": ["YYYY-MM-DD", ...]}
 is_locally_skipped() {
     [ -f "$SKIPS_FILE" ] || return 1
@@ -320,17 +374,79 @@ print(msg)
 PY
 }
 
+# Espelha o .skips.json no worker (POST /skips, KV skips:<email>) para a ROTINA
+# DA NUVEM tambem pular o dia. E a alternativa ao /pular do Telegram: o estado do
+# /pular vive na mensagem fixada do chat com o bot, e quem escolheu e-mail nao
+# tem chat. Precisa de notify.url + notify.secret + notify.email no config.json;
+# sem os tres, nao faz nada (fluxo de quem usa Telegram ou so o cron local
+# intacto). Falha aqui NAO derruba o comando: o skip local ja esta gravado.
+#
+# Vale tambem no `pulos`: reenviar a lista inteira e idempotente e conserta um
+# espelhamento que falhou antes — por isso nao existe um caminho de leitura
+# separado.
+push_skips() {
+    local url secret email fields payload out
+    [ -f "$CONFIG" ] || return 0
+    fields="$(python3 -c '
+import json, sys
+try:
+    n = json.load(open(sys.argv[1])).get("notify", {}) or {}
+except Exception:
+    n = {}
+print(n.get("url", ""))
+print(n.get("secret", ""))
+print(n.get("email", ""))
+' "$CONFIG")" || return 0
+    url="$(sed -n 1p <<<"$fields")"
+    secret="$(sed -n 2p <<<"$fields")"
+    email="$(sed -n 3p <<<"$fields")"
+    [ -n "$url" ] && [ -n "$secret" ] && [ -n "$email" ] || return 0
+
+    payload="$(python3 -c '
+import json, sys
+try:
+    skips = json.load(open(sys.argv[2])).get("skips") or []
+except Exception:
+    skips = []
+print(json.dumps({"email": sys.argv[1], "dates": skips}))
+' "$email" "$SKIPS_FILE")" || return 0
+
+    if ! out="$(curl -sf --max-time 10 \
+        -H "content-type: application/json" \
+        -H "x-notify-secret: ${secret}" \
+        --data-raw "$payload" \
+        "${url%/}/skips")"; then
+        echo "AVISO: skip gravado localmente, mas o worker nao aceitou o espelho — a rotina da nuvem ainda vai rodar nesse dia. Rode 'checkin.sh pulos' depois para tentar de novo." >&2
+        return 0
+    fi
+    # Mostra o que ficou valendo na nuvem: o worker descarta fim de semana e
+    # passado, entao a lista de volta e o que a rotina de fato vai respeitar.
+    python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+print("Skips na nuvem: " + (", ".join(d.get("dates") or []) or "nenhum"))
+' "$out"
+}
+
 cmd_pular() {
     [ -n "${1:-}" ] || { echo "ERRO: uso: checkin.sh pular DD/MM (ou hoje/amanha/YYYY-MM-DD)" >&2; exit 1; }
     skip_tool add "$1"
+    push_skips
 }
 
 cmd_retomar() {
     [ -n "${1:-}" ] || { echo "ERRO: uso: checkin.sh retomar DD/MM" >&2; exit 1; }
     skip_tool remove "$1"
+    push_skips
+    # Se um tick de hoje ja fechou o dia por causa do skip, destrava — senao a
+    # cron continuaria parando no .auto_state.json depois do retomar.
+    case "$(day_done || true)" in *pul*|*skip*) rm -f "$AUTO_STATE" ;; esac
 }
 
-cmd_pulos() { skip_tool list; }
+cmd_pulos() { skip_tool list; push_skips; }
 
 # Confirmacao de repositorios (so leitura) — delega ao auto_activity.py.
 cmd_repos() { python3 "$DIR/auto_activity.py" --list-repos "$@"; }
@@ -377,29 +493,69 @@ cmd_auto() {
 
     NOTIFY_ON_ERR=true
 
-    # 1. Ignora fim de semana
-    local dow; dow="$(date +%u)"
-    if [ "$dow" -eq 6 ] || [ "$dow" -eq 7 ]; then
-        echo "Hoje e fim de semana. Pulando check-in."
+    # 1. Dia ja resolvido (enviado, pulado, fim de semana, feriado, sem
+    #    convocacao). PRIMEIRA guarda de todas: e ela que faz a 2a e a 3a
+    #    execucao do dia custarem nada e nao repetirem aviso nenhum — sem isso o
+    #    dia pulado rendia um 🚫 por tick. Dia sem atividade NAO grava estado —
+    #    de proposito, para o tick da tarde pegar o commit que apareceu depois.
+    local motivo_dia
+    # Excecao: dia fechado pelo /pular do bot e destravado se o dev deu /retomar
+    # no bot depois — esse retomar so mexe na mensagem fixada, nao neste arquivo.
+    # Telegram fora do ar (2) nao destrava: na duvida, o dia segue pulado.
+    if motivo_dia="$(day_done)" && [ "$motivo_dia" = "pulado no bot" ]; then
+        local sk=0; is_skipped || sk=$?
+        [ "$sk" -eq 1 ] && rm -f "$AUTO_STATE"
+    fi
+    if [ "$dry_run" != "true" ] && [ "$force" != "true" ] && motivo_dia="$(day_done)"; then
+        echo "Check-in de hoje ja resolvido ($motivo_dia). Nada a fazer."
+        NOTIFY_ON_ERR=false
         return 0
     fi
 
-    # 2. Ignora feriado
+    # 2. Ignora fim de semana
+    local dow; dow="$(date +%u)"
+    if [ "$dow" -eq 6 ] || [ "$dow" -eq 7 ]; then
+        echo "Hoje e fim de semana. Pulando check-in."
+        [ "$dry_run" = "true" ] || mark_day_done "fim de semana"
+        NOTIFY_ON_ERR=false
+        return 0
+    fi
+
+    # 2a. Ignora feriado
     if is_holiday; then
         echo "Hoje e feriado. Pulando check-in."
+        [ "$dry_run" = "true" ] || mark_day_done "feriado"
+        NOTIFY_ON_ERR=false
         return 0
     fi
 
     # 2b. Ignora se o dia foi cancelado via /pular (mensagem fixada no Telegram)
-    #     ou via skip local (checkin.sh pular / arquivo .skips.json).
+    #     ou via skip local (checkin.sh pular / arquivo .skips.json). Fecha o dia:
+    #     o aviso sai UMA vez, e os ticks seguintes param na guarda 1 sem nem
+    #     chamar o Telegram de novo.
     if is_locally_skipped; then
         echo "Check-in de hoje cancelado via skip local (.skips.json). Pulando."
+        [ "$dry_run" = "true" ] || mark_day_done "skip local"
         notify "🚫 lab-checkin: check-in de hoje NAO enviado — skip local. Para desfazer: checkin.sh retomar hoje"
+        NOTIFY_ON_ERR=false
         return 0
     fi
     if is_skipped; then
         echo "Check-in de hoje cancelado via /pular (mensagem fixada no Telegram). Pulando."
+        [ "$dry_run" = "true" ] || mark_day_done "pulado no bot"
         notify "🚫 lab-checkin: check-in de hoje NAO enviado — cancelado via /pular. Para desfazer: /retomar hoje"
+        NOTIFY_ON_ERR=false
+        return 0
+    fi
+
+    # 2d. O Lab nao pediu check-in hoje (nenhum card). Sai antes da coleta e sem
+    #     virar erro: retentar nao muda nada, e o ERR trap gastaria um ❌ por tick.
+    local motivo
+    if motivo="$(no_convocacao)"; then
+        echo "O Lab nao pediu check-in hoje: $motivo"
+        [ "$dry_run" = "true" ] || mark_day_done "o Lab nao pediu check-in hoje"
+        notify "ℹ️ lab-checkin: o Lab nao pediu check-in hoje — $motivo. Se isso estiver errado, fale com o admin do Lab."
+        NOTIFY_ON_ERR=false
         return 0
     fi
 
@@ -461,6 +617,7 @@ Hoje:
 $today"
     done
 
+    [ "$dry_run" = "true" ] || mark_day_done "enviado"
     NOTIFY_ON_ERR=false
 }
 
