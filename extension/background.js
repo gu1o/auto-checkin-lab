@@ -1,57 +1,132 @@
-// background.js — service worker MV3 do modo automatico (Fase 5).
-//
-// Um alarme diario (chrome.alarms) roda o check-in no horario configurado na
-// aba Configuracoes, usando a sessao viva do navegador (cookies via
-// host_permissions) — sem cookie manual e sem cron. So precisa do Chrome
-// aberto e do login valido no Lab.
+const DAILY_URL = 'https://lab.idealtrends.io/saude-entrega/daily';
 
-importScripts('lib.js');
-
-const ALARM_NAME = 'auto-checkin';
-
-// Proximo timestamp (ms) do horario HH:MM local; se ja passou hoje, amanha.
-function nextAlarmTime(hhmm) {
-  const [h, m] = hhmm.split(':').map(Number);
-  const next = new Date();
-  next.setHours(h, m, 0, 0);
-  if (next.getTime() <= Date.now()) {
-    next.setDate(next.getDate() + 1);
-  }
-  return next.getTime();
-}
-
-async function reschedule() {
-  const cfg = await loadConfigData();
-  await chrome.alarms.clear(ALARM_NAME);
-  if (cfg.autoEnabled && cfg.autoTime && /^\d{1,2}:\d{2}$/.test(cfg.autoTime)) {
-    chrome.alarms.create(ALARM_NAME, {
-      when: nextAlarmTime(cfg.autoTime),
-      periodInMinutes: 24 * 60
-    });
-  }
-}
-
-chrome.runtime.onInstalled.addListener(reschedule);
-chrome.runtime.onStartup.addListener(reschedule);
-
-// Salvou config no popup? Reagenda (cobre toggle, mudanca de horario, etc.).
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.config) reschedule();
+chrome.runtime.onInstalled.addListener(() => {
+  createDailyAlarm();
 });
+
+chrome.runtime.onStartup.addListener(() => {
+  createDailyAlarm();
+});
+
+function createDailyAlarm() {
+  const now = new Date();
+  const target = new Date(now);
+  target.setHours(11, 0, 0, 0);
+
+  if (now >= target) {
+    target.setDate(target.getDate() + 1);
+  }
+
+  chrome.alarms.create('checkin-reminder', {
+    delayInMinutes: (target - now) / 60000,
+    periodInMinutes: 1440
+  });
+}
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name !== ALARM_NAME) return;
-  const result = await runAutoCheckin();
-  console.log('[lab-checkin] auto:', result.status, '-', result.detail);
+  if (alarm.name === 'checkin-reminder') {
+    const today = new Date();
+    if (today.getDay() === 0 || today.getDay() === 6) {
+      return;
+    }
+    await checkAndNotify();
+    await updateBadge();
+  }
 });
 
-// Botao "Pular amanhã" das notificacoes do navegador (Fase 5a): registra o
-// skip local para o proximo dia util.
-chrome.notifications.onButtonClicked.addListener(async (notifId, btnIdx) => {
-  if (btnIdx !== 0) return;
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  await addLocalSkip(localIsoDate(tomorrow));
-  chrome.notifications.clear(notifId);
-  notifyBrowser('lab-checkin', `Check-in de ${localIsoDate(tomorrow)} será pulado.`);
+async function sendTelegram(msg) {
+  const cfg = await chrome.storage.local.get(['config']);
+  const token = cfg.config?.tgToken;
+  const chatId = cfg.config?.tgChatId;
+  if (!token || !chatId) return;
+
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'Markdown' })
+    });
+  } catch (err) {
+    console.log('sendTelegram error:', err.message);
+  }
+}
+
+async function checkAndNotify() {
+  try {
+    const response = await fetch(DAILY_URL, { credentials: 'include' });
+    if (!response.ok) return;
+
+    const html = await response.text();
+    const match = html.match(/data-page="([^"]*)"/);
+    if (!match) return;
+
+    const decoded = match[1]
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+
+    const pageData = JSON.parse(decoded);
+    const cards = pageData.props?.cards || [];
+    const hasCheckin = cards.some(card => card.existing);
+
+    if (!hasCheckin) {
+      const dateStr = new Date().toLocaleDateString('pt-BR');
+      await sendTelegram(
+        `⚠️ *Check-in pendente!*\n\nO check-in de *${dateStr}* ainda não foi preenchido no Ideal Lab.\n\nAcesse a extensão para preencher.`
+      );
+    }
+  } catch (err) {
+    console.log('checkAndNotify error:', err.message);
+  }
+}
+
+async function updateBadge() {
+  try {
+    const response = await fetch(DAILY_URL, { credentials: 'include' });
+    if (!response.ok) {
+      chrome.action.setBadgeText({ text: '?' });
+      chrome.action.setBadgeBackgroundColor({ color: '#888' });
+      return;
+    }
+
+    const html = await response.text();
+    const match = html.match(/data-page="([^"]*)"/);
+    if (!match) {
+      chrome.action.setBadgeText({ text: '' });
+      return;
+    }
+
+    const decoded = match[1]
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+
+    const pageData = JSON.parse(decoded);
+    const cards = pageData.props?.cards || [];
+    const hasCheckin = cards.some(card => card.existing);
+
+    if (hasCheckin) {
+      chrome.action.setBadgeText({ text: '' });
+    } else {
+      chrome.action.setBadgeText({ text: '!' });
+      chrome.action.setBadgeBackgroundColor({ color: '#e53935' });
+    }
+  } catch (err) {
+    console.log('updateBadge error:', err.message);
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'refreshBadge') {
+    updateBadge().then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.type === 'triggerNotify') {
+    checkAndNotify().then(() => sendResponse({ ok: true }));
+    return true;
+  }
 });

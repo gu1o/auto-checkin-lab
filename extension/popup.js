@@ -48,20 +48,52 @@ async function checkSession() {
   }
 }
 
-function readInitiativeConfig() {
-  const repos = {};
-  const projects = {};
-  document.querySelectorAll('[id^="repo-input-"]').forEach(input => {
-    const id = input.id.replace('repo-input-', '');
-    const value = input.value.trim();
-    if (value) repos[id] = value;
-  });
-  document.querySelectorAll('[id^="jira-project-"]').forEach(input => {
-    const id = input.id.replace('jira-project-', '');
-    const value = input.value.trim();
-    if (value) projects[id] = value;
-  });
-  return { repos, projects };
+// Load existing check-in for today (pre-fill form if already submitted)
+async function loadExistingCheckin() {
+  try {
+    const response = await fetch('https://lab.idealtrends.io/saude-entrega/daily');
+    if (!response.ok) return;
+
+    const html = await response.text();
+    const match = html.match(/data-page="([^"]*)"/);
+    if (!match) return;
+
+    const decoded = match[1]
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+
+    const pageData = JSON.parse(decoded);
+    const cards = pageData.props?.cards || [];
+
+    for (const card of cards) {
+      const existing = card.existing;
+      if (existing && card.initiativeId) {
+        document.getElementById('checkin-initiative').value = String(card.initiativeId);
+        if (existing.confidenceScore) {
+          document.getElementById('checkin-confidence').value = String(existing.confidenceScore);
+        }
+        if (existing.yesterdayText) {
+          document.getElementById('checkin-yesterday').value = existing.yesterdayText;
+        }
+        if (existing.todayText) {
+          document.getElementById('checkin-today').value = existing.todayText;
+        }
+        if (existing.blockersText) {
+          document.getElementById('checkin-blockers').value = existing.blockersText;
+        }
+        if (existing.yesterdayArtifactUrl) {
+          document.getElementById('checkin-artifact').value = existing.yesterdayArtifactUrl;
+        }
+        showToast('Check-in de hoje já existe. Campos preenchidos com os dados atuais.', 'success');
+        return;
+      }
+    }
+  } catch (err) {
+    console.log('Could not load existing check-in:', err.message);
+  }
 }
 
 // Save Settings
@@ -74,18 +106,10 @@ document.getElementById('config-form').addEventListener('submit', (e) => {
     bbToken: document.getElementById('bb-token').value.trim(),
     bbUsername: document.getElementById('bb-username').value.trim(),
     bbWorkspace: document.getElementById('bb-workspace').value.trim(),
-    bbProjectKey: document.getElementById('bb-project-key').value.trim(),
-    initiativeConfig: readInitiativeConfig(),
-    llmProvider: document.getElementById('llm-provider').value,
+    bbRepos: document.getElementById('bb-repos').value.trim(),
     geminiKey: document.getElementById('gemini-key').value.trim(),
-    anthropicKey: document.getElementById('anthropic-key').value.trim(),
-    tgBotToken: document.getElementById('tg-bot-token').value.trim(),
-    tgChatId: document.getElementById('tg-chat-id').value.trim(),
-    notifyUrl: document.getElementById('tg-worker-url').value.trim(),
-    notifySecret: document.getElementById('tg-notify-secret').value.trim(),
-    defaultInitiative: document.getElementById('default-initiative').value,
-    autoEnabled: document.getElementById('auto-enabled').checked,
-    autoTime: document.getElementById('auto-time').value
+    tgToken: document.getElementById('tg-token').value.trim(),
+    tgChatId: document.getElementById('tg-chat-id').value.trim()
   };
 
   if (config.llmProvider === 'claude' && !config.anthropicKey) {
@@ -100,218 +124,110 @@ document.getElementById('config-form').addEventListener('submit', (e) => {
   });
 });
 
-// Exportar config.json (Fase 3): ponte para quem tambem roda CLI/cron —
-// configura uma vez na UI, exporta, coloca na pasta do repo.
-document.getElementById('btn-export').addEventListener('click', async () => {
-  const cfg = await loadConfigData();
-  // Captura o cookie remember_web da sessao viva do navegador: o export sai
-  // pronto para a rotina/CLI sem o dev abrir o DevTools.
-  const labCookie = await getRememberCookie().catch(() => null);
-  const json = JSON.stringify(buildConfigJson(cfg, labCookie), null, 2) + '\n';
-  const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'config.json';
-  a.click();
-  URL.revokeObjectURL(url);
-  if (labCookie) {
-    showToast('config.json exportado (cookie do Lab incluído).');
-  } else {
-    showToast('config.json exportado SEM o cookie do Lab — faça login em lab.idealtrends.io e exporte de novo.', 'error');
-  }
-});
-
-document.getElementById('btn-import').addEventListener('click', () => {
-  document.getElementById('import-file').click();
-});
-
-document.getElementById('import-file').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-
-  try {
-    const text = await file.text();
-    const imported = JSON.parse(text);
-
-    const config = {
-      jiraUrl: imported.jira?.url || '',
-      jiraEmail: imported.jira?.email || '',
-      jiraToken: imported.jira?.api_token || '',
-      bbToken: imported.bitbucket?.api_token || '',
-      bbUsername: imported.bitbucket?.username || '',
-      bbWorkspace: imported.bitbucket?.workspace || '',
-      bbProjectKey: imported.bitbucket?.project_key || '',
-      llmProvider: imported.llm_provider || 'gemini',
-      geminiKey: imported.gemini?.api_key || '',
-      anthropicKey: imported.anthropic?.api_key || '',
-      tgBotToken: imported.telegram?.bot_token || '',
-      tgChatId: imported.telegram?.chat_id || '',
-      notifyUrl: imported.notify?.url || '',
-      notifySecret: imported.notify?.secret || '',
-      defaultInitiative: imported.defaultInitiative || '',
-      autoEnabled: false,
-      autoTime: '09:30',
-      initiativeConfig: imported.initiative_config || {}
-    };
-
-    await new Promise(resolve => chrome.storage.local.set({ config }, resolve));
-    loadConfig();
-    showToast('Configurações importadas com sucesso!');
-  } catch (err) {
-    showToast('Erro ao importar: ' + err.message, 'error');
-  }
-
-  e.target.value = '';
-});
-
-// Teste do Telegram: valida token + chat_id como estao digitados no form (nao
-// precisa salvar antes) enviando um 🧪 pelo bot. Diferente do telegramNotify
-// (lib.js), aqui o erro da API e mostrado ao usuario — e o ponto do teste.
-document.getElementById('btn-tg-test').addEventListener('click', async () => {
-  const btn = document.getElementById('btn-tg-test');
-  const spinner = document.getElementById('tg-test-spinner');
-  const token = document.getElementById('tg-bot-token').value.trim();
+// Test Telegram
+document.getElementById('btn-test-telegram').addEventListener('click', async () => {
+  const token = document.getElementById('tg-token').value.trim();
   const chatId = document.getElementById('tg-chat-id').value.trim();
+  const statusEl = document.getElementById('tg-test-status');
 
   if (!token || !chatId) {
-    showToast('Preencha o Bot Token e o chat_id antes de testar.', 'error');
+    statusEl.textContent = 'Preencha token e chat ID primeiro.';
+    statusEl.className = 'test-status error';
     return;
   }
 
-  btn.disabled = true;
-  spinner.classList.remove('hidden');
+  statusEl.textContent = 'Enviando...';
+  statusEl.className = 'test-status';
+
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: Number(chatId),
-        text: '🧪 Teste do lab-checkin (extensão) — Telegram configurado! As notificações do check-in automático vão chegar neste chat.'
+        chat_id: chatId,
+        text: '✅ Teste de notificação do Ideal Lab Check-in funcionando!',
+        parse_mode: 'Markdown'
       })
     });
-    const data = await res.json().catch(() => ({ ok: false }));
-    if (!data.ok) throw new Error(data.description || `HTTP ${res.status}`);
-    showToast('Mensagem de teste enviada — confira o Telegram!');
+
+    const data = await res.json();
+    if (data.ok) {
+      statusEl.textContent = 'OK! Mensagem enviada.';
+      statusEl.className = 'test-status success';
+    } else {
+      statusEl.textContent = 'Erro: ' + (data.description || 'resposta inválida');
+      statusEl.className = 'test-status error';
+    }
   } catch (err) {
-    showToast('Falha no teste: ' + err.message, 'error');
-  } finally {
-    btn.disabled = false;
-    spinner.classList.add('hidden');
+    statusEl.textContent = 'Erro: ' + err.message;
+    statusEl.className = 'test-status error';
   }
 });
 
-// Conectar Telegram por deep link (Fase 1C): gera o link no worker, abre o
-// chat, e faz polling ate o worker devolver o chat_id — sem digitar nada.
-document.getElementById('btn-tg-connect').addEventListener('click', async () => {
-  const btn = document.getElementById('btn-tg-connect');
-  const spinner = document.getElementById('tg-connect-spinner');
-  const workerUrl = document.getElementById('tg-worker-url').value.trim().replace(/\/$/, '');
-  const botToken = document.getElementById('tg-bot-token').value.trim();
-  if (!workerUrl || !botToken) {
-    showToast('Preencha a URL do worker e o Bot Token primeiro.', 'error');
-    return;
-  }
+// Simulate pending check-in notification
+document.getElementById('btn-test-notify').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-test-notify');
   btn.disabled = true;
-  spinner.classList.remove('hidden');
+  showToast('Simulando verificação do check-in...');
   try {
-    const res = await fetch(`${workerUrl}/devlink`, {
+    const cfg = (await chrome.storage.local.get(['config'])).config;
+    if (!cfg?.tgToken || !cfg?.tgChatId) {
+      showToast('Configure o Telegram primeiro.', 'error');
+      btn.disabled = false;
+      return;
+    }
+
+    const response = await fetch('https://lab.idealtrends.io/saude-entrega/daily', { credentials: 'include' });
+    if (!response.ok) {
+      showToast('Falha ao acessar Ideal Lab (sessão expirada?).', 'error');
+      btn.disabled = false;
+      return;
+    }
+
+    const html = await response.text();
+    const match = html.match(/data-page="([^"]*)"/);
+    if (!match) {
+      showToast('Não foi possível ler os dados da página.', 'error');
+      btn.disabled = false;
+      return;
+    }
+
+    const decoded = match[1]
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+    const pageData = JSON.parse(decoded);
+    const cards = pageData.props?.cards || [];
+    const hasCheckin = cards.some(card => card.existing);
+    const dateStr = new Date().toLocaleDateString('pt-BR');
+
+    if (hasCheckin) {
+      showToast('Check-in já preenchido hoje. Enviando simulação mesmo assim...');
+    }
+
+    const msg = hasCheckin
+      ? `⚠️ *SIMULAÇÃO - Check-in já preenchido*\n\nO check-in de *${dateStr}* foi simulado como pendente para teste.\n\n(Notificação real só é enviada se estiver pendente às 11h.)`
+      : `⚠️ *Check-in pendente!*\n\nO check-in de *${dateStr}* ainda não foi preenchido no Ideal Lab.\n\nAcesse a extensão para preencher.`;
+
+    const res = await fetch(`https://api.telegram.org/bot${cfg.tgToken}/sendMessage`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: botToken })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: cfg.tgChatId, text: msg, parse_mode: 'Markdown' })
     });
-    const data = await res.json().catch(() => ({ ok: false }));
-    if (!data.ok || !data.link) throw new Error(data.error || `HTTP ${res.status}`);
-    window.open(data.link, '_blank');
-    showToast('Abra o Telegram e toque em Iniciar — aguardando conexão...');
-    for (let i = 0; i < 30; i++) {
-      await new Promise(r => setTimeout(r, 2000));
-      const s = await fetch(`${workerUrl}/devlink?code=${encodeURIComponent(data.code)}`)
-        .then(r => r.json()).catch(() => ({}));
-      if (s.status === 'linked' && s.chatId) {
-        document.getElementById('tg-chat-id').value = String(s.chatId);
-        const cfg = await loadConfigData();
-        cfg.tgChatId = String(s.chatId);
-        cfg.notifyUrl = workerUrl;
-        await new Promise(r => chrome.storage.local.set({ config: cfg }, r));
-        showToast(`✅ Telegram conectado! chat_id ${s.chatId} salvo.`);
-        return;
-      }
+
+    const data = await res.json();
+    if (data.ok) {
+      showToast('Notificação de pendência enviada via Telegram!');
+    } else {
+      showToast('Erro Telegram: ' + (data.description || 'desconhecido'), 'error');
     }
-    showToast('Não detectei a conexão. Toque em Iniciar no bot e tente de novo.', 'error');
   } catch (err) {
-    showToast('Erro ao conectar: ' + err.message, 'error');
-  } finally {
-    btn.disabled = false;
-    spinner.classList.add('hidden');
+    showToast('Erro: ' + err.message, 'error');
   }
+  btn.disabled = false;
 });
-
-function applyDefaultInitiative(cfg) {
-  if (cfg.defaultInitiative) {
-    const select = document.getElementById('checkin-initiative');
-    if ([...select.options].some(o => o.value === String(cfg.defaultInitiative))) {
-      select.value = String(cfg.defaultInitiative);
-    }
-  }
-}
-
-function renderInitiativeConfigInputs(saved) {
-  const container = document.getElementById('initiative-config-container');
-  const options = [...document.getElementById('default-initiative').options].filter(o => o.value);
-  if (!options.length) {
-    container.innerHTML = '<p class="text-muted" style="font-size: 12px; opacity: 0.6;">Nenhuma iniciativa carregada</p>';
-    return;
-  }
-  const savedRepos = (saved && saved.repos) || {};
-  const savedProjects = (saved && saved.projects) || {};
-  container.innerHTML = '';
-  options.forEach(opt => {
-    const card = document.createElement('div');
-    card.className = 'form-group';
-    card.style.marginBottom = '16px';
-    card.innerHTML = `
-      <label style="font-weight: 600;">${opt.text}</label>
-      <div class="form-group row" style="margin-top: 6px;">
-        <div class="col">
-          <label for="jira-project-${opt.value}" style="font-size: 11px;">Projeto Jira</label>
-          <input type="text" id="jira-project-${opt.value}" class="form-control" placeholder="Ex: AUDIT" value="${savedProjects[opt.value] || ''}">
-        </div>
-        <div class="col">
-          <label for="repo-input-${opt.value}" style="font-size: 11px;">Repositórios</label>
-          <input type="text" id="repo-input-${opt.value}" class="form-control" placeholder="Repositórios separados por vírgula" value="${savedRepos[opt.value] || ''}">
-        </div>
-      </div>
-    `;
-    container.appendChild(card);
-  });
-}
-
-let currentInitiative = '';
-
-async function saveDraft(initiativeId) {
-  const initiative = initiativeId || document.getElementById('checkin-initiative').value;
-  if (!initiative) return;
-  const yesterday = document.getElementById('checkin-yesterday').value;
-  const today = document.getElementById('checkin-today').value;
-  const result = await chrome.storage.local.get(['drafts']);
-  const drafts = result.drafts || {};
-  drafts[initiative] = { yesterday, today };
-  await chrome.storage.local.set({ drafts });
-}
-
-async function loadDraftForInitiative(initiativeId) {
-  if (!initiativeId) return;
-  const result = await chrome.storage.local.get(['drafts']);
-  const draft = (result.drafts || {})[initiativeId];
-  document.getElementById('checkin-yesterday').value = draft?.yesterday || '';
-  document.getElementById('checkin-today').value = draft?.today || '';
-}
-
-let saveDraftTimer;
-function scheduleSaveDraft() {
-  clearTimeout(saveDraftTimer);
-  saveDraftTimer = setTimeout(saveDraft, 500);
-}
 
 // Load Settings
 function loadConfig() {
@@ -327,18 +243,8 @@ function loadConfig() {
       document.getElementById('bb-project-key').value = cfg.bbProjectKey || '';
       document.getElementById('llm-provider').value = cfg.llmProvider || 'gemini';
       document.getElementById('gemini-key').value = cfg.geminiKey || '';
-      document.getElementById('anthropic-key').value = cfg.anthropicKey || '';
-      document.getElementById('tg-bot-token').value = cfg.tgBotToken || '';
+      document.getElementById('tg-token').value = cfg.tgToken || '';
       document.getElementById('tg-chat-id').value = cfg.tgChatId || '';
-      document.getElementById('tg-worker-url').value = cfg.notifyUrl || '';
-      document.getElementById('tg-notify-secret').value = cfg.notifySecret || '';
-      document.getElementById('default-initiative').value = String(cfg.defaultInitiative || '6');
-      document.getElementById('auto-enabled').checked = !!cfg.autoEnabled;
-      document.getElementById('auto-time').value = cfg.autoTime || '09:30';
-      renderInitiativeConfigInputs(cfg.initiativeConfig);
-      applyDefaultInitiative(cfg);
-      currentInitiative = document.getElementById('checkin-initiative').value;
-      loadDraftForInitiative(currentInitiative);
     }
   });
 }
@@ -573,41 +479,14 @@ function renderUnmappedSuggestions(unmapped, initiatives) {
       o.textContent = init.name;
       select.appendChild(o);
     });
-    select.value = String(bestInitiativeMatch(item.key, initiatives));
-
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn btn-secondary btn-sm';
-    btn.textContent = 'Vincular';
-    btn.addEventListener('click', async () => {
-      const initId = select.value;
-      const inputId = item.type === 'project' ? `jira-project-${initId}` : `repo-input-${initId}`;
-      if (!appendToInput(inputId, item.key)) {
-        showToast('Salve as configurações uma vez para carregar as iniciativas e tente de novo.', 'error');
-        return;
-      }
-      await persistInitiativeConfig();
-      row.remove();
-      showToast(`${item.key} vinculado — mapeamento salvo.`);
-    });
-
-    row.appendChild(label);
-    row.appendChild(select);
-    row.appendChild(btn);
-    container.appendChild(row);
-  });
-}
-
-document.getElementById('btn-detect-unmapped').addEventListener('click', async () => {
-  const btn = document.getElementById('btn-detect-unmapped');
-  const spinner = document.getElementById('detect-spinner');
-  spinner.classList.remove('hidden');
-  btn.disabled = true;
-  try {
-    const cfg = await loadConfigData();
-    if (!cfg.jiraUrl || !cfg.jiraEmail || !cfg.jiraToken) {
-      showToast('Configure o Jira primeiro.', 'error');
-      return;
+    
+    if (postRes.status === 200 || postRes.status === 302 || postRes.status === 303) {
+      showToast('Check-in enviado com sucesso!');
+      checkSession();
+      loadExistingCheckin();
+      chrome.runtime.sendMessage({ type: 'refreshBadge' });
+    } else {
+      throw new Error('POST retornou status HTTP ' + postRes.status);
     }
     const sinceStr = localIsoDate(getLastBusinessDay());
     const jiraAct = await fetchJira(cfg, sinceStr).catch(() => []);
@@ -629,7 +508,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadInitiatives();
   currentInitiative = document.getElementById('checkin-initiative').value;
   loadConfig();
-  loadDraftForInitiative(currentInitiative);
-  checkSession();
-  refreshLocalSkips();
+  checkSession().then(() => loadExistingCheckin());
+  chrome.runtime.sendMessage({ type: 'refreshBadge' });
 });
