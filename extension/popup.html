@@ -37,8 +37,7 @@
           <div class="col">
             <label for="checkin-initiative">Iniciativa</label>
             <select id="checkin-initiative" class="form-control">
-              <option value="6">6 - Auditoria Ideal</option>
-              <option value="17">17 - Soluções Industriais</option>
+              <option value="">Carregando iniciativas...</option>
             </select>
           </div>
           <div class="col flex-grow-0">
@@ -85,6 +84,10 @@
         <button type="button" class="btn btn-primary btn-block" id="btn-submit" disabled>
           Enviar Check-in
         </button>
+        <button type="button" class="btn btn-secondary btn-block" id="btn-skip-tomorrow" style="margin-top: 8px;">
+          🚫 Pular amanhã (automático)
+        </button>
+        <p id="local-skips" class="text-muted" style="font-size: 12px; opacity: 0.6; margin-top: 6px;"></p>
       </section>
 
       <!-- Configuration Tab -->
@@ -127,17 +130,113 @@
               </div>
             </div>
             <div class="form-group">
-              <label for="bb-repos">Repositórios (separados por vírgula)</label>
-              <input type="text" id="bb-repos" class="form-control" placeholder="Ex: auditoriaideal.com.br, outro-repo (vazio para todos)">
+              <label for="bb-project-key">Project key (opcional)</label>
+              <input type="text" id="bb-project-key" class="form-control" placeholder="Ex: IDEALPLUS — filtra repos por project (vazio = todos)">
             </div>
           </div>
 
-          <!-- Gemini Settings -->
+          <!-- Config por Iniciativa -->
+          <div class="section-card" id="initiative-config-card">
+            <h4>Projetos e Repositórios por Iniciativa</h4>
+            <div id="initiative-config-container">
+              <p class="text-muted" style="font-size: 12px; opacity: 0.6;">As iniciativas serão carregadas ao salvar</p>
+            </div>
+            <div class="row" style="gap: 8px; margin-top: 12px;">
+              <div class="col">
+                <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-suggest">
+                  <span class="spinner hidden" id="suggest-spinner"></span>
+                  💡 Sugerir automaticamente
+                </button>
+              </div>
+              <div class="col">
+                <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-detect-unmapped">
+                  <span class="spinner hidden" id="detect-spinner"></span>
+                  🔍 Detectar projetos novos
+                </button>
+              </div>
+            </div>
+            <div id="unmapped-container" style="margin-top: 12px;"></div>
+          </div>
+
+          <!-- LLM Settings (motor plugavel: Gemini ou Claude) -->
           <div class="section-card">
-            <h4>Gemini AI</h4>
+            <h4>Motor de Geração (IA)</h4>
             <div class="form-group">
-              <label for="gemini-key">Gemini API Key</label>
-              <input type="password" id="gemini-key" class="form-control" placeholder="Chave da API do Google AI Studio">
+              <label for="llm-provider">Provider</label>
+              <select id="llm-provider" class="form-control">
+                <option value="gemini" selected>Gemini (free tier)</option>
+                <option value="claude">Claude (API Anthropic)</option>
+              </select>
+            </div>
+            <div class="form-group row">
+              <div class="col">
+                <label for="gemini-key">Gemini API Key</label>
+                <input type="password" id="gemini-key" class="form-control" placeholder="Chave do Google AI Studio">
+              </div>
+              <div class="col">
+                <label for="anthropic-key">Anthropic API Key</label>
+                <input type="password" id="anthropic-key" class="form-control" placeholder="sk-ant-...">
+              </div>
+            </div>
+          </div>
+
+          <!-- Telegram Settings -->
+          <div class="section-card">
+            <h4>Telegram</h4>
+            <div class="form-group row">
+              <div class="col">
+                <label for="tg-bot-token">Bot Token</label>
+                <input type="password" id="tg-bot-token" class="form-control" placeholder="Token do @CheckInLabBot (compartilhado no time)">
+              </div>
+              <div class="col">
+                <label for="tg-chat-id">Seu chat_id</label>
+                <input type="text" id="tg-chat-id" class="form-control" placeholder="Conecte pelo botão abaixo ou /start no bot">
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="tg-worker-url">URL do worker (bot)</label>
+              <input type="url" id="tg-worker-url" class="form-control" placeholder="https://lab-checkin-bot.<sub>.workers.dev">
+            </div>
+            <div class="form-group">
+              <label for="tg-notify-secret">NOTIFY_SECRET (opcional — notificação via worker, sem bot_token no config)</label>
+              <input type="password" id="tg-notify-secret" class="form-control" placeholder="Deixe vazio para notificar direto pelo Telegram">
+            </div>
+            <div class="row" style="gap: 8px;">
+              <div class="col">
+                <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-tg-connect">
+                  <span class="spinner hidden" id="tg-connect-spinner"></span>
+                  🔗 Conectar Telegram
+                </button>
+              </div>
+              <div class="col">
+                <button type="button" class="btn btn-secondary btn-sm btn-block" id="btn-tg-test">
+                  <span class="spinner hidden" id="tg-test-spinner"></span>
+                  🧪 Enviar teste
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Preferencias + Modo automatico -->
+          <div class="section-card">
+            <h4>Preferências e Automação</h4>
+            <div class="form-group row">
+              <div class="col">
+                <label for="default-initiative">Iniciativa padrão</label>
+                <select id="default-initiative" class="form-control">
+                  <option value="">Carregando iniciativas...</option>
+                </select>
+              </div>
+              <div class="col">
+                <label for="auto-time">Horário do automático</label>
+                <input type="time" id="auto-time" class="form-control" value="09:30">
+              </div>
+            </div>
+            <div class="form-group">
+              <label>
+                <input type="checkbox" id="auto-enabled">
+                Modo automático (envia sozinho no horário, com Chrome aberto)
+              </label>
             </div>
           </div>
 
@@ -160,6 +259,15 @@
           </div>
 
           <button type="submit" class="btn btn-primary btn-block">Salvar Configurações</button>
+          <div class="row" style="gap: 8px; margin-top: 8px;">
+            <div class="col">
+              <button type="button" class="btn btn-secondary btn-block" id="btn-export">Exportar config.json</button>
+            </div>
+            <div class="col">
+              <button type="button" class="btn btn-secondary btn-block" id="btn-import">Importar config.json</button>
+              <input type="file" id="import-file" accept=".json" style="display: none">
+            </div>
+          </div>
         </form>
       </section>
     </main>
@@ -167,6 +275,7 @@
     <!-- Toast Notification Banner -->
     <div id="toast" class="toast hidden"></div>
   </div>
+  <script src="lib.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

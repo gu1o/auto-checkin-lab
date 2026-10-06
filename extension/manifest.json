@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Ideal Lab Check-in",
-  "version": "1.0.0",
-  "description": "Preenche automaticamente e audita o check-in diário no Ideal Lab usando Jira, Bitbucket e Gemini.",
+  "version": "2.0.0",
+  "description": "Preenche (manual ou automaticamente) e audita o check-in diário no Ideal Lab usando Jira, Bitbucket e IA (Gemini ou Claude).",
   "permissions": [
     "cookies",
     "storage",

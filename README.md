@@ -2,17 +2,28 @@
 
 Script e Extensão do Chrome para preencher e auditar o check-in diário de **Saúde da Entrega** no Ideal Lab (`https://lab.idealtrends.io/saude-entrega/daily`).
 
+> **É novo por aqui?** Comece pelo **[guia de setup para devs](docs/guia-setup-dev.md)** — ele compara os três modos de usar (extensão, rotina no Claude Code ou CLI+cron), lista as credenciais necessárias e traz o passo a passo de cada um. A escolha do modo é sua.
+
 ---
 
 ## 📂 Estrutura de Arquivos
 
 | Arquivo/Diretório | Descrição |
 |---|---|
-| `checkin.sh` | CLI principal (subcomandos `status`, `submit` e `auto`) |
+| `.claude/skills/setup-checkin/` | Skill do Claude Code: rode `/setup-checkin` na pasta do repo para configurar o check-in automático guiado — escolhe onde roda (rotina na nuvem ou cron local), pega as credenciais dos conectores MCP (Atlassian/Ideal Lab) ou do export da extensão, valida e agenda |
+| `.claude/settings.json` | Hook `SessionStart`: se o repo ainda não tem `config.json`, o Claude abre a sessão perguntando ao dev qual setup ele quer e chama a skill sozinho |
+| `checkin.sh` | CLI principal (subcomandos `status`, `submit`, `auto` e os skips locais `pular`/`retomar`/`pulos`) |
 | `auto_activity.py` | Script auxiliar que busca tarefas no Jira, commits no Bitbucket e sintetiza textos usando Gemini |
-| `config.json.example` | Template de configuração para as integrações do Jira, Bitbucket e Gemini |
-| `extension/` | Código fonte da Extensão do Chrome (Interface Gráfica com Auditoria) |
+| `config.json.example` | Template de configuração para as integrações do Jira, Bitbucket, Gemini/Claude e Telegram |
+| `extension/` | Código fonte da Extensão do Chrome (auditoria/envio manual + modo automático via `chrome.alarms`; `lib.js` compartilhado entre `popup.js` e `background.js`) |
 | `cookies.txt.example` | Template do cookie jar para uso exclusivo via CLI |
+| `worker/` | Cloudflare Worker do bot do Telegram (@CheckInLabBot), **multi-usuário**: auto-registro `/start` + aprovação do admin (Workers KV), `/pular`, `/retomar`, `/pulos`, `/testar` (valida as credenciais salvas contra Jira, Bitbucket, Lab e IA — somente leitura, nada é enviado ao Lab) e `/config` (formulário one-time-link para credenciais + **estilo de escrita**, criptografadas com AES-GCM; após salvar, a página oferece um botão **🧪 Testar credenciais**). Com `/aprovar on`, o rascunho vai para o chat com botões **✅ Enviar / ✏️ Refazer** antes de ir ao Lab — recusar faz o bot pedir o contexto e regerar. Checagem: `node worker/test_draft.mjs` |
+| `telegram_poller.py` | Alternativa local ao worker (long-polling via systemd) — desativado enquanto o webhook estiver ativo |
+| `docs/telegram-integration.md` | Arquitetura da integração com o Telegram (notificações + bot) |
+| `docs/plano-compartilhamento.md` | Plano para abrir a automação para o time (multi-usuário, extensão como hub, motor Gemini/Claude, modo automático) |
+| `docs/plano-rollout-time.md` | Escopo consolidado do rollout para o time: skill `/setup-checkin`, tool MCP `submit-daily-checkin` no Lab, `project_key` do Bitbucket, roteamento multi-iniciativa e canais de notificação |
+| `CHANGELOG.md` | O que mudou, por versão, com tags dizendo o que cada mudança exige do dev (`[rotina]` = atualizar a rotina do claude.ai; `[cli]`/`[extensão]` = só `git pull`; `[worker]` = deploy do admin). Depois de um `git pull`, o Claude compara com o `.checkin-version` local e avisa |
+| `docs/guia-setup-dev.md` | **Guia de setup para o dev**: tabela de decisão entre os modos (extensão / rotina Claude Code / CLI), credenciais, prompt template da rotina e troubleshooting |
 
 ---
 
@@ -28,10 +39,15 @@ Esta é a opção recomendada caso você prefira **revisar e auditar** os textos
 
 ### 🚀 Como usar:
 1. Clique no ícone da extensão na barra de ferramentas do Chrome.
-2. Acesse a aba **Configurações** e preencha suas credenciais do Jira, Bitbucket e Gemini API Key. As credenciais ficam salvas de forma segura no storage local do seu próprio navegador.
+2. Acesse a aba **Configurações** e preencha suas credenciais do Jira, Bitbucket e da IA. As credenciais ficam salvas de forma segura no storage local do seu próprio navegador.
+   - **Motor de Geração (IA)**: escolha o provider — **Gemini** (free tier, default) ou **Claude** (API da Anthropic; cada dev usa a própria API key, chamada direta do browser).
+   - **Telegram** (opcional): token do bot (compartilhado no time) + seu `chat_id` (mande `/start` pro **@CheckInLabBot** — ele te responde já registrado, após aprovação do admin). Habilita notificações e o `/pular`. Use o botão **🧪 Enviar mensagem de teste** para validar o token/chat_id na hora (ou mande `/testar` no chat do bot).
+   - **Iniciativa padrão** e **horário** do modo automático.
 3. Na aba **Check-in**, selecione a iniciativa e clique em **Gerar Rascunho**. O rascunho de *Ontem* e *Hoje* será carregado automaticamente com base nas APIs.
 4. Revise os textos e clique em **Enviar Check-in**!
 5. **Autenticação automática**: A extensão lê a sessão ativa diretamente do seu navegador, dispensando qualquer configuração de arquivo `cookies.txt`.
+6. **Modo automático** (opcional): com o toggle ligado, um alarme diário (`chrome.alarms`) roda o check-in sozinho no horário configurado — mesmas guardas do CLI (fim de semana → feriado → `/pular` → já preenchido) — usando a sessão viva do navegador. Só precisa do Chrome aberto; se a sessão do Lab expirar, você é avisado no Telegram (❌).
+7. **Exportar config.json**: gera e baixa o arquivo no formato do `config.json.example` com o que está configurado na extensão — a ponte para quem também roda o CLI/cron.
 
 ---
 
@@ -65,6 +81,7 @@ O CLI autentica utilizando o cookie `remember_web_*` do Laravel.
    - **Jira**: Insira a URL, seu e-mail e seu API Token do Atlassian.
    - **Bitbucket**: Insira seu Workspace, o repositório, o seu nome de usuário (para filtro) e o API Token da Atlassian (com a permissão `Repositories: Read`).
    - **Gemini**: Insira sua chave de API gerada no Google AI Studio.
+   - **Telegram** (opcional): bot token (via @BotFather) e chat ID para receber notificações do modo `auto` — ✅ quando o check-in for enviado (com o resumo gerado) e ❌ quando falhar (ex.: cookie `remember_web` expirado). Deixe em branco para desativar; os pulos (fim de semana, feriado, já preenchido) não notificam. Detalhes em `docs/telegram-integration.md`.
 
 ### 🚀 Uso da CLI:
 
@@ -79,6 +96,13 @@ O subcomando `auto` coleta seus dados das APIs, resume usando IA e realiza a pos
 ```
 
 * **Inteligência de Feriados**: O modo automático ignora finais de semana e feriados (incluindo cálculo dinâmico de feriados móveis como Carnaval, Sexta-feira Santa e Corpus Christi, além de feriados federais e de SP). 
+* **Respeita o `/pular`**: se o dia foi cancelado via `/pular` no @CheckInLabBot (mensagem fixada no chat, lida via `getChat` com o `telegram` do `config.json`), o script não preenche e avisa no Telegram (🚫). Sem Telegram configurado, a checagem é pulada; falha na chamada não bloqueia o check-in.
+* **Pular dias sem Telegram**: `./checkin.sh pular DD/MM` (também `hoje`/`amanha`/`YYYY-MM-DD`) grava a data em `.skips.json` e o `auto` respeita; `retomar DD/MM` desfaz e `pulos` lista. Com `notify.url` + `notify.secret` + `notify.email` no `config.json`, o comando também espelha a lista no worker (`POST /skips` → KV `skips:<e-mail>`) e a **rotina do modo B** passa a respeitar o skip — é a alternativa ao `/pular` do bot para quem não tem Telegram. Ele imprime `Skips na nuvem: ...` de volta; sem essa linha, o espelho não subiu.
+* **Filtro de repositórios por padrão**: `bitbucket.repositories` no `config.json` aceita **padrões** (regex/substring, case-insensitive) casados contra os repos do workspace — ex.: `["auditoriaideal"]` pega `auditoriaideal.com.br`, `api.auditoriaideal.com.br` e `local-infra.auditoriaideal.com.br` (e futuros com o mesmo nome) sem listar slug a slug; um slug exato continua valendo. `bitbucket.repositories_exclude` remove padrões (ex.: `["-old$"]` tira o repositório antigo). Vazio = todos do workspace (ou do `project_key`). Padrão sem match vira aviso no log.
+* **Filtro de autor dos commits**: um commit conta se o `author.raw` contiver um dos `bitbucket.author_emails` (vazio = o `jira.email`) **ou** o `bitbucket.username`. Casar só por username derrubava commits em silêncio quando o `user.name` do git (ex.: `Guio`) diverge do display name da conta Atlassian (`Guilherme Ribeiro`). Use `author_emails` se você commita com mais de um e-mail. Sem username e sem e-mail, a coleta é aberta.
+* **Roteamento multi-iniciativa**: com `initiative_config` no `config.json` (mapas `repos`/`projects` por id de iniciativa), o `auto` roteia a atividade e faz um submit por iniciativa com atividade; `--initiative` é a padrão (atividade não mapeada + dia sem atividade).
+* **Agendamento (modelo tick)**: com `schedule.enabled`/`schedule.time` no `config.json`, uma crontab de tick (ex.: a cada 15 min) só envia no/depois do horário e uma vez por dia — resolve máquina desligada no horário exato. `--force` ignora o gate.
+* **Notificação via worker (opcional)**: com `notify.url`+`notify.secret`, as notificações vão pelo endpoint `/notify` do worker (o `bot_token` sai do config do dev); sem eles, envio direto pelo Telegram. Acrescentando `notify.email`, o worker entrega por e-mail (Resend) — é o canal de quem não tem Telegram, e funciona em qualquer domínio (Outlook/M365 inclusive). O domínio precisa estar em `NOTIFY_EMAIL_DOMAINS` no worker. No modo nuvem a rotina ainda manda um **sinal de vida** (`{"email":..., "heartbeat":true}`) em todo desfecho, e o worker cobra por e-mail às 18h de SP quando o ping do dia não chega — é o único aviso possível quando a rotina não roda (pausada, sem crédito, morta antes de notificar), porque falha que não executa não se notifica sozinha.
 * **Ontem Vazio**: Se o dia anterior foi um feriado ou fim de semana, a seção `ONTEM` será automaticamente enviada em branco.
 * **Sem Duplicidade**: Se o check-in do dia já foi preenchido, o script pula a execução para evitar sobrescrever dados manuais.
 

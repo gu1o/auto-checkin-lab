@@ -1,2 +1,8 @@
 config.json
 cookies.txt
+.poller_state.json
+.skips.json
+.claude/.setup-declined
+.checkin-version
+__pycache__/
+.auto_state.json

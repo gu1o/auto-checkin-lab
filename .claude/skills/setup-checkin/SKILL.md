@@ -1,0 +1,547 @@
+---
+name: setup-checkin
+description: Configura o check-in automático diário da Saúde da Entrega (Ideal Lab) para o dev atual — pergunta onde vai rodar (rotina agendada na nuvem ou cron local), pega as credenciais dos conectores MCP (Atlassian/Ideal Lab) ou do config.json da extensão, valida tudo e cria o agendamento. Use quando o dev quiser ativar, reconfigurar ou renovar credenciais do check-in automático — e também depois de um `git pull`, para conferir no CHANGELOG.md o que mudou e atualizar a rotina dele.
+---
+
+# Setup do check-in automático (Ideal Lab)
+
+Você vai configurar o check-in diário de Saúde da Entrega para o dev que está
+executando esta skill, criando uma **rotina agendada na conta dele** no Claude
+Code. Siga as etapas na ordem. Contexto completo: `docs/guia-setup-dev.md`.
+
+Regras gerais:
+- **Nunca imprima tokens/cookies no chat** — refira-se a eles como "o token do
+  Jira", "o cookie do Lab" etc.
+- Pare em qualquer validação que falhar, explique a correção e aguarde o dev.
+- Se já existir uma rotina de check-in criada por uma execução anterior
+  (procure com a skill `schedule` listando as rotinas por nome contendo
+  "check-in" ou "lab-checkin"), **atualize-a** em vez de criar duplicata —
+  este é também o fluxo de renovação de cookie.
+
+## Modo atualização (depois de um `git pull`)
+
+Se o dev já tem `config.json` e já roda o check-in, e o que ele quer é aplicar
+mudanças novas do repo, **não refaça o setup**:
+
+1. Leia o `CHANGELOG.md` e o `.checkin-version` (versão aplicada por último;
+   ausente = nunca aplicada). As entradas acima dela são o que ele ainda não tem.
+2. Resuma em 2–3 linhas o que mudou e o que cada tag exige dele: `[rotina]` =
+   rotina do claude.ai desatualizada; `[local]` = `config.json`/`crontab` dele
+   desatualizados (item 3 abaixo); `[cli]`/`[extensão]` = o `git pull` já
+   resolveu (extensão pede recarregar em `chrome://extensions`); `[worker]` =
+   deploy do admin, ele não faz nada.
+3. Com entrada `[local]`: a entrada do CHANGELOG diz o que mudou. Leia o
+   `config.json` dele e o `crontab -l`, aponte o que falta (campo novo ausente,
+   linha de cron com horário/formato antigo), **mostre a mudança antes de
+   aplicar** e só então edite — sem tocar em credencial que já funciona e sem
+   apagar outras linhas do crontab. Não sabendo o valor de um campo novo
+   (ex.: secret do admin), peça ao dev em vez de inventar.
+4. Sem entrada `[rotina]` nem `[local]`: só grave a versão nova em
+   `.checkin-version` e encerre.
+5. Com entrada `[rotina]`: localize a rotina existente (skill `schedule`, nome
+   com "check-in"/"lab-checkin"), **mostre ao dev o que vai mudar no prompt
+   antes de mexer** e atualize só os trechos afetados — credenciais, iniciativas
+   e principalmente o bloco `Estilo`/exemplos são dele e não se tocam sem ele
+   pedir. Atualize o carimbo `# lab-checkin roteiro <versão>` da primeira linha
+   e grave a mesma versão em `.checkin-version`.
+
+Se o dev pedir setup novo, ou não houver `config.json`, siga a partir da etapa 0.
+
+**Ligar notificação numa rotina já existente**: mesmo caminho — localize a
+rotina, escolha o canal (etapa 3) e reescreva **apenas** o bloco `Notificar`
+do prompt. Não refaça credenciais, iniciativas nem estilo.
+
+## 0. Duas escolhas iniciais
+
+Pergunte as duas com `AskUserQuestion` (se a sessão começou com o aviso de
+"repo sem config.json", a primeira já pode ter sido respondida).
+
+**0.1 Onde roda** (define a etapa 6):
+
+- **Nuvem** — rotina agendada na conta claude.ai do dev. Roda com a máquina
+  desligada; é o setup do Guilherme. Default.
+- **Local** — `cron` na máquina do dev chamando `checkin.sh auto`. Só roda com
+  a máquina ligada; precisa de key de IA (Gemini free serve) para gerar o texto.
+
+**0.2 Origem das credenciais** (default: **MCP** se ele já usa conectores):
+
+- **MCP** — Jira e Lab (leitura) vêm dos conectores da conta dele; só o token
+  do Bitbucket e o cookie do Lab são digitados. Sem extensão. **Só vale no modo
+  nuvem** — o `checkin.sh` local não fala MCP, então local ⇒ config.json.
+- **config.json da extensão** — tudo vem do export (etapa 1).
+
+Modo MCP: peça para o dev conectar em `claude.ai` → Configurações → Conectores:
+**Atlassian** (Jira) e **Ideal Lab**. As tools de conector são *deferred*: só o
+nome aparece, o schema não. Carregue antes de chamar, sempre pelo nome completo
+com prefixo — `ToolSearch("select:mcp__claude_ai_Atlassian__atlassianUserInfo,mcp__claude_ai_Ideal_Lab__list-initiatives")`
+— e confirme chamando as duas. Só considere o conector desconectado se a tool
+falhar *depois* de carregada; "não achei a tool" com nome curto (sem prefixo)
+é falso negativo, não desconexão. Depois peça no chat:
+
+| Dado | Como obter |
+|---|---|
+| Token do Bitbucket (`Repositories: Read`) | id.atlassian.com → Security → API tokens |
+| Cookie `remember_web` do Lab | Extensão → "Exportar config.json", ou DevTools → Application → Cookies em `lab.idealtrends.io` |
+
+Grave-os em `config.json` (mesmo formato do `config.json.example`, campos de
+Jira vazios) para o `/testar` e o CLI reaproveitarem, e pule para a etapa 4.
+
+> O cookie é obrigatório mesmo no modo A: o MCP do Lab lê iniciativas e saúde,
+> mas não envia check-in diário — o envio é o POST em `/saude-entrega/daily`.
+
+## 1. Obter o config.json (modo B)
+
+Procure `config.json` na raiz deste repositório. Se não existir, oriente o dev:
+
+1. Instalar a extensão: `chrome://extensions` → Modo do desenvolvedor →
+   "Carregar sem compactação" → pasta `extension/` deste repo.
+2. Fazer login em `https://lab.idealtrends.io` no navegador.
+3. Na aba **Configurações** da extensão: preencher Jira, Bitbucket e — se
+   quiser notificações — Telegram; salvar; clicar **Exportar config.json**
+   (o cookie do Lab é capturado automaticamente da sessão do navegador).
+4. Mover o arquivo baixado para a raiz do repo.
+
+Aguarde o dev confirmar antes de continuar. **Não commite o config.json**
+(confira que está no .gitignore; se não estiver, adicione).
+
+## 2. Validar o conteúdo
+
+Leia o arquivo e confira:
+
+| Campo | Obrigatório | Se faltar |
+|---|---|---|
+| `jira.url`, `jira.email`, `jira.api_token` | Sim | Voltar à etapa 1 |
+| `bitbucket.api_token`, `bitbucket.workspace` | Sim | Voltar à etapa 1 |
+| `lab.cookie_name`, `lab.cookie_value` | Sim | Export antigo ou dev deslogado do Lab: pedir para logar no Lab e re-exportar |
+| `telegram.bot_token`, `telegram.chat_id` | Não | Perguntar se quer notificações (etapa 3); sem elas a rotina roda silenciosa |
+| `initiative_config` (mapa por iniciativa) | Não | Resolver iniciativas na etapa 4 |
+
+## 3. Canal de notificação (opcional)
+
+Pergunte com `AskUserQuestion` qual canal ele quer — **não assuma Telegram**:
+
+- **Telegram** (default se já tem conta) — ✅/❌/🚫 e os comandos remotos.
+- **E-mail** — a rotina manda o resumo para o e-mail dele (etapa 3.2). Sem
+  `/testar` nem `/config` (isso é só do bot); para pular dias, `checkin.sh
+  pular` (etapa 3.3).
+- **Nenhum por enquanto** — a rotina roda silenciosa; falha só aparece no
+  histórico de execuções da rotina no claude.ai. Diga isso explicitamente.
+
+Escolhendo "nenhum", avise que dá para ligar depois sem refazer nada: basta
+rodar `/setup-checkin` e pedir "quero notificação" — a skill acha a rotina
+existente (mesmo fluxo do modo atualização) e troca **só o bloco `Notificar`**
+do prompt, sem tocar em credenciais, iniciativas ou estilo.
+
+### 3.1 Telegram
+
+Se ele escolheu Telegram e o config estiver vazio:
+
+1. Mandar `/start` para o **@CheckInLabBot** e aguardar aprovação do admin
+   (Guilherme).
+2. O token do bot é compartilhado no time — o dev pega com o admin; o chat_id
+   o próprio bot informa após aprovação.
+3. Preencher na extensão e re-exportar (ou informar aqui os dois valores).
+
+O bot também dá `/pular DD/MM` (cancela um dia), `/testar` (valida as
+credenciais salvas no `/config`) e `/config` (formulário seguro de
+credenciais na nuvem). Atalho: na extensão, o botão **🔗 Conectar Telegram**
+faz o registro por deep link e já preenche o `chat_id` sozinho (sem digitar).
+
+### 3.2 E-mail
+
+**Pergunte o e-mail de trabalho dele** (endereço completo — o domínio decide a
+rota, então não peça o domínio antes: ele já vem no endereço). Confirme o que
+leu de volta antes de gravar. Duas rotas, escolha pelo domínio:
+
+| Domínio | Rota | Por quê |
+|---|---|---|
+| Google Workspace / gmail.com | **Conector Gmail** da conta do dev, ou o worker | Ele já tem o conector; zero infra |
+| Outlook / M365 / qualquer outro | **Worker `/notify`** (Resend) | O conector Gmail não alcança caixa Microsoft |
+
+O time está migrando de Google Workspace para Microsoft — na dúvida, ou se o
+dev não souber dizer, use o **worker**: funciona para qualquer domínio e não
+quebra quando a conta Google dele for desativada.
+
+**Rota worker** (`notify.url` + `notify.secret` + `notify.email` no
+`config.json`; peça a URL e o secret ao admin se ele não tiver):
+
+1. Grave o endereço em `notify.email` do `config.json` — é o registro do canal,
+   e é dele que a rotina e o `checkin.sh` tiram o destinatário.
+2. Valide antes de seguir (o dev tem que receber o e-mail de teste):
+   ```bash
+   curl -sS -X POST "{NOTIFY_URL}/notify" -H 'content-type: application/json' \
+     -H "x-notify-secret: {NOTIFY_SECRET}" \
+     -d '{"email":"{EMAIL}","text":"teste do lab-checkin"}'
+   ```
+   `{"ok":true}` = entregue. **403 `dominio nao liberado`** = o domínio dele não
+   está em `NOTIFY_EMAIL_DOMAINS` no `wrangler.toml` do worker: peça ao admin
+   para acrescentar e redeployar (é fail-closed de propósito — o secret é
+   compartilhado no time e sem a lista viraria relay aberto). **502** = o admin
+   não configurou `RESEND_API_KEY`/`NOTIFY_EMAIL_FROM`.
+3. No modo nuvem, libere o host do worker na allowlist de egress (etapa 7.1).
+4. **Watchdog** (só modo nuvem, automático): a rotina pinga o worker em todo
+   desfecho (`{"email": "...", "heartbeat": true}` — bloco `Sinal de vida` do
+   prompt) e o worker cobra por e-mail às 18h de SP quando o ping do dia não
+   chega. É o que cobre a rotina que **não roda** — pausada, sem crédito, ou
+   morta antes de conseguir avisar. Nada a configurar: o registro nasce no
+   primeiro ping e expira sozinho 30 dias depois do último. Valide junto com
+   o teste acima:
+   ```bash
+   curl -sS -X POST "{NOTIFY_URL}/notify" -H 'content-type: application/json' \
+     -H "x-notify-secret: {NOTIFY_SECRET}" \
+     -d '{"email":"{EMAIL}","heartbeat":true}'
+   ```
+   `{"ok":true,"heartbeat":true}` = registrado (nenhum e-mail é enviado).
+
+**Rota conector Gmail** (só modo nuvem): nada a configurar, o conector é da
+conta do dev — inclua `mcp__Gmail` e `ToolSearch` no `allowed_tools` da rotina.
+Avise do modo de falha: se o OAuth do conector cair, a notificação de falha é
+que falha, calada.
+
+### 3.3 Pular dias sem Telegram
+
+Quem tem o bot usa `/pular` e o calendário. Sem Telegram, o comando é o do
+repo — **funciona igual no modo nuvem**, porque ele espelha as datas no worker:
+
+```bash
+./checkin.sh pular 05/09      # ou hoje / amanha / 2026-09-05
+./checkin.sh retomar 05/09
+./checkin.sh pulos            # lista, e reenvia o espelho se ele tinha falhado
+```
+
+O comando grava em `.skips.json` (que é o que a cron local lê) **e** faz
+`POST /skips` no worker, que guarda em `skips:<e-mail>` — é de lá que a guarda
+da rotina na nuvem lê. Ele imprime `Skips na nuvem: ...` de volta: se essa linha
+não aparecer, o espelho não subiu e a rotina **vai** rodar no dia.
+
+Requisito: `notify.url` + `notify.secret` + `notify.email` no `config.json`.
+Sem os três o comando só grava local, calado sobre a nuvem. Na **rota conector
+Gmail** (etapa 3.2) o dev não recebe URL/secret por causa da notificação —
+peça-os ao admin de todo jeito se ele quiser pular dias, é o mesmo par do
+`/notify`. O domínio do e-mail tem que estar em `NOTIFY_EMAIL_DOMAINS`: o
+secret é compartilhado no time e sem essa trava um dev pularia o dia do outro.
+
+O dev não precisa decorar nada disso — "pula meu check-in de sexta" no Claude
+Code resolve, é este comando.
+
+## 4. Validar credenciais e descobrir iniciativas
+
+Execute os checks abaixo (via curl/fetch) e mostre um relatório ✅/❌. Todos
+são somente-leitura. **No modo MCP**, troque o check do Jira por
+`atlassianUserInfo` e o das iniciativas por `list-initiatives` do MCP do Lab
+(o check do cookie continua valendo — é ele que envia).
+
+- **Jira**: `GET {jira.url}/rest/api/3/myself` com `Authorization: Basic
+  base64(email:api_token)` → 200; guarde o displayName.
+- **Bitbucket**: `GET https://api.bitbucket.org/2.0/repositories/{workspace}?pagelen=1`
+  — token começando com `ATATT` usa Basic `base64(jira.email:token)`; outros
+  usam `Bearer` → 200.
+- **Lab**: `GET https://lab.idealtrends.io/saude-entrega/daily` com header
+  `Cookie: {cookie_name}={cookie_value}`, **sem seguir redirect** → 200 =
+  sessão ativa; 302 = cookie inválido (relogar + re-exportar).
+- **Telegram** (se configurado): `getChat` com o chat_id → ok.
+
+Do HTML do Lab (200), extraia o JSON do atributo `data-page` (HTML-escaped) e
+liste os **cards de iniciativas vinculadas** do dev (`initiativeId`,
+`initiativeName`) — use na próxima etapa.
+
+## 5. Definir agenda, iniciativas e estilo de escrita
+
+Pergunte ao dev (com defaults):
+
+- **Horário** do check-in (default 09:30, seg–sex; a rotina pula fim de
+  semana/feriado sozinha de qualquer forma). No modo nuvem esse é o horário da
+  **primeira** tentativa: a etapa 6-nuvem agenda mais duas no mesmo dia, que só
+  fazem algo se o envio tiver falhado.
+- **Iniciativa(s)**: mostre as encontradas no Lab. Uma só → essa é a padrão.
+  Mais de uma em que ele trabalha → monte o mapa por iniciativa
+  (`initiative_config` do export já pode trazer repos/projetos Jira por
+  iniciativa — confirme com o dev) e defina uma default para atividade não
+  mapeada.
+
+### 5.1 Exemplos de estilo (peça sempre — é o que evita texto genérico)
+
+O Lab não expõe check-ins anteriores (a página só devolve os cards de hoje),
+então o único jeito de o agente escrever como o dev é ele colar exemplos. Sem
+isso o texto sai correto e sem cara de ninguém ("Realizei atividades de
+desenvolvimento e correções") — e o time percebe.
+
+Peça no chat:
+
+> Cole 2–3 check-ins seus de verdade (o par "Ontem"/"Hoje"), do jeito que
+> você escreveria. Pode ser do Lab, do Slack ou o que você diria na daily de
+> hoje. Se não tiver à mão, escreva um de exemplo — é o que a rotina vai
+> imitar todo dia.
+
+Se ele não tiver nenhum, use `AskUserQuestion` para fechar o estilo em uma
+rodada (não faça um interrogatório): bullets × frases corridas; 1ª pessoa ×
+impessoal; cita código de task (`PROJ-123`) × só o assunto. Registre também
+qualquer termo do domínio que ele usa (nome de módulo, de cliente).
+
+Guarde o resultado — os exemplos e as regras vão no bloco `Estilo` do prompt
+da etapa 6-nuvem. **Não invente exemplos em nome do dev**: sem material,
+mantenha só as regras.
+
+Se o dev usa o **runner do worker** (`/runner on` no bot) em vez da rotina,
+o mesmo material vai no campo **Estilo de escrita** do formulário `/config` —
+avise que lá também existe `/aprovar on`, que manda o rascunho no chat com
+botões ✅/✏️ antes de enviar (recusar = o bot pede o contexto e regera). Na
+rotina cloud isso não existe: ela roda e morre, sem esperar clique.
+
+No modo **local** pule esta etapa: o `auto_activity.py` usa um prompt fixo, e
+personalizar exige editar a função `generate_text_gemini` no arquivo — diga
+isso ao dev em vez de prometer um campo de config que não existe.
+
+## 6. Criar o agendamento
+
+### 6-local — cron na máquina do dev
+
+Só se ele escolheu **Local** em 0.1. Confira que o `config.json` tem a key de
+IA (`gemini`/`claude`) — sem ela o `auto` não gera texto — e valide com
+`./checkin.sh auto --dry-run` (não envia nada; mostre a saída ao dev). Depois
+acrescente a entrada de cron, sem apagar as existentes e sem duplicar
+(`crontab -l` primeiro; se já houver linha com `checkin.sh`, substitua-a):
+
+```
+{MIN} {H1},{H2},{H3} * * 1-5 cd {REPO} && ./checkin.sh auto >> /tmp/lab-checkin.log 2>&1
+```
+
+Três horários, não um: o escolhido na etapa 5 mais duas retentativas ~3h depois,
+sem passar das 18h (09:30 → `30 9,12,16`) — mesma lógica do modo nuvem, para o
+dia em que o Lab está fora do ar na hora do envio. Só a execução que resolve o
+dia custa alguma coisa: ela grava `.auto_state.json` e as seguintes param nele
+antes de tocar no Jira/Bitbucket/IA. "Resolver" inclui os dias em que não há o
+que enviar — pulado (`/pular` ou `checkin.sh pular`), fim de semana, feriado,
+Lab sem convocação —, então o aviso desses dias também sai uma vez só. Dia sem atividade não grava — de propósito,
+o tick da tarde pega o commit que apareceu depois. Retentativa não conserta
+cookie expirado nem campo novo no formulário: aí as três falham igual.
+
+Alternativa se a máquina costuma estar desligada no horário: `schedule.enabled`
+/ `schedule.time` no config + cron de tick a cada 15 min (`*/15 * * * *`) — o
+gate interno só envia no/depois do horário, e o `.auto_state.json` faz os ticks
+seguintes saírem de graça. Pule para a etapa 7 (só o item 3 se aplica).
+
+### 6-nuvem — rotina agendada no claude.ai
+
+Monte o prompt da rotina a partir do template abaixo, preenchendo os
+placeholders com os dados do config (as credenciais entram no corpo da rotina,
+que é privada da conta do dev). Em seguida crie a rotina com a skill
+`schedule`: seg–sex, timezone `America/Sao_Paulo`, nome `lab-checkin`, cron
+`{MIN} {H1},{H2},{H3} * * 1-5` — o horário escolhido na etapa 5 mais duas
+retentativas ~3h depois, sem passar das 18h (09:30 → `30 9,12,16`; 14:00 →
+`0 14,16,18`).
+
+As retentativas existem para o dia em que o envio falha sem ser culpa da
+rotina: Lab fora do ar, formulário sem o modal de envio, 5xx no POST. Dia que
+não tem check-in a fazer — fim de semana, feriado, dia pulado, Lab sem
+convocação — não é caso de retentativa nenhuma: as guardas param as três
+execuções, e o aviso (🚫 ou ℹ️) sai uma vez só, não uma por horário. Em dia
+normal elas não custam quase nada — com o card já preenchido a execução para na
+guarda 3, antes de tocar no Jira e no Bitbucket, e não notifica ninguém. O que
+elas **não** resolvem é cookie expirado ou campo novo no formulário: aí as três
+falham igual, e o ❌ é para o dev agir.
+
+A primeira linha do prompt carimba a versão do roteiro (a mais recente do
+`CHANGELOG.md`) — é o que permite, num `git pull` futuro, saber se a rotina
+está atrasada sem ler o prompt inteiro. **Atualize esse carimbo sempre que
+reescrever a rotina.**
+
+```text
+# lab-checkin roteiro {VERSAO_DO_CHANGELOG}
+
+Você preenche meu check-in diário de Saúde da Entrega no Ideal Lab.
+
+Credenciais: Jira {URL} (email {EMAIL}, token {JIRA_TOKEN}); Bitbucket
+workspace {WORKSPACE} (token {BB_TOKEN}); cookie do Lab
+{COOKIE_NAME}={COOKIE_VALUE}; Telegram bot {BOT_TOKEN}, chat {CHAT_ID}.
+[omitir a linha do Telegram se não configurado]
+[modo MCP: troque a parte do Jira por "Use o conector Atlassian (MCP) para o
+Jira. As tools são deferred — carregue primeiro com
+ToolSearch(\"select:mcp__Atlassian__searchJiraIssuesUsingJql,mcp__Atlassian__getJiraIssue\"),
+sempre pelo nome completo com o prefixo mcp__<nome do connector>__ (na rotina
+cloud o connector chama Atlassian ⇒ mcp__Atlassian__). Busque com
+assignee = currentUser() passando fields: [\"summary\",\"status\",\"updated\"] —
+sem isso o retorno traz a description inteira de cada issue e estoura o limite
+de tokens. Se a tool não aparecer pelo nome curto, é falso negativo — use o
+nome completo; e se o Jira falhar mesmo assim, siga só com o Bitbucket em vez
+de abortar." e mantenha Bitbucket/cookie/Telegram como acima]
+
+Regra de shell (obrigatória — esta rotina roda sozinha, sem ninguém para
+aprovar nada): nunca use `&` para rodar comando em segundo plano e nunca deixe
+aspa desbalanceada. O sandbox exige aprovação humana para qualquer comando em
+que o `&` possa ser operador de background — e o `&` de query string entra
+nessa conta quando as aspas não fecham; sem ninguém para aprovar, o comando
+fica ~1 min preso e morre com "unexpected EOF". Uma chamada Bash = um comando
+curto: uma chamada por repositório, sem loop `for` de várias linhas juntando
+tudo. Toda URL entre aspas simples ('https://...?pagelen=20&fields=x,y'). Para
+mandar JSON de arquivo no curl use `--data @arquivo` (o `-d`/`--data` lê o
+arquivo); `--data-raw "@arquivo"` envia o literal `@arquivo` como corpo. No
+relatório final, diga se algum comando ficou preso em pedido de aprovação,
+citando o comando.
+
+⚠️ `allowed_tools` da rotina **precisa incluir `ToolSearch`** além de
+`mcp__<connector>` — sem ela o agente não consegue carregar o schema de
+nenhuma tool de conector e reporta "tool não existe".
+
+Guardas — pare silenciosamente se qualquer uma valer (mas mande o Sinal de
+vida do fim deste prompt ANTES de parar: parada é desfecho, não é sumiço):
+1. Hoje é fim de semana ou feriado nacional/SP (calcule os móveis: Carnaval,
+   Sexta-feira Santa, Corpus Christi).
+2. Hoje está na minha lista de dias pulados — leia a mensagem fixada do meu
+   chat com o bot via getChat (formato "SKIP: YYYY-MM-DD, ..."). Estando na
+   lista, pare — e notifique 🚫 **uma vez só**: apenas se esta execução for a
+   do primeiro horário do dia ({H1}); nas retentativas pare calado (só o Sinal
+   de vida). Dia pulado não tem nada a retentar, e três 🚫 iguais treinam o
+   dev a ignorar o aviso.
+   [variante sem Telegram — troque a leitura acima por esta, NÃO remova a
+   guarda: sem bot token não existe mensagem fixada para ler (e getChat sem
+   token derrubaria a rotina antes de ela fazer qualquer coisa), mas as datas do
+   `checkin.sh pular` estão no worker:
+   `curl -sf --max-time 10 -H 'x-notify-secret: {NOTIFY_SECRET}' '{NOTIFY_URL}/skips?email={EMAIL}'`
+   e veja se a data de hoje está no `dates` da resposta. Se o curl falhar ou não
+   devolver JSON, **siga com o check-in** em vez de parar: consulta que caiu não
+   é dia pulado, e parar aqui seria um dia sem check-in e sem ninguém avisado.]
+3. O Lab não pediu check-in hoje — na tela aparece "Nenhum módulo ativo nesta
+   data" (há alocação, mas nenhum módulo/versão ativo hoje). Vale se QUALQUER um
+   destes aparecer no data-page: (a) `props.cards` VAZIO; (b) `props.semConvocacao`
+   não nulo e sem card da minha iniciativa; (c) o card da minha iniciativa existe
+   mas sem módulo ativo hoje (lista de módulos vazia, módulo nulo ou flag
+   equivalente). O motivo e os módulos vêm em `props.semConvocacao` (`motivo`,
+   `modulos[].nome`/`motivo`). NÃO é erro — encerre sem erro e sem coletar
+   Jira/Bitbucket. As retentativas checam de novo (a alocação pode mudar no dia);
+   o ℹ️ com o motivo sai só na última execução do dia. Sem esta guarda o dia vira
+   ⚠️ "sem atividade" ou ❌ de envio reprovado. No relatório final, liste os NOMES
+   das chaves de `props` e do card (sem valores) — é o que permite endurecer a
+   guarda no `checkin.sh`/worker depois.
+4. O check-in de hoje já está preenchido (GET em
+   https://lab.idealtrends.io/saude-entrega/daily com o cookie; os cards vêm
+   no atributo data-page, HTML-escaped). É esta guarda que faz a retentativa
+   sair barata: a rotina roda mais de uma vez por dia e, com o dia já
+   resolvido, para aqui antes de coletar qualquer coisa.
+   [SE MULTI-INICIATIVA: só pare se TODAS as iniciativas do mapa já tiverem
+   card preenchido; faltando alguma, siga — no Enviar você manda só as que
+   faltam.]
+
+Coleta: minhas issues do Jira atualizadas desde o último dia útil
+(assignee = currentUser()) e meus commits no Bitbucket desde então
+(repositórios: {REPOS_OU_TODOS} — cada entrada é um padrão regex/substring
+casado contra os slugs do workspace, ex. "auditoriaideal" pega
+auditoriaideal.com.br, api.auditoriaideal.com.br e
+local-infra.auditoriaideal.com.br). Um commit é meu se o author.raw contiver
+o e-mail {EMAIL} **ou** o usuário {BB_USERNAME} — o user.name do meu git
+diverge do display name da conta Atlassian, então NÃO filtre só pelo display
+name (isso descarta commits em silêncio). Colete de todos os branches: chame
+/commits com um include= por branch de refs/branches com target.date desde o
+último dia útil, já que sem include o endpoint só devolve o branch principal
+e meus commits ficam em branches de feature até o merge.
+
+Estilo — escreva como EU escrevo, não como um assistente escreveria:
+- 1ª pessoa, tom de daily falada, direto ao ponto.
+- Não cite código de task (PROJ-123); fale do assunto por extenso.
+- Agrupe commits em realizações lógicas, não liste commit a commit.
+- 2 a 4 linhas por campo; sem preâmbulo ("Hoje eu irei...") e sem
+  fechamento ("Qualquer dúvida, estou à disposição").
+- Nunca invente: atividade que não aparece no Jira/Bitbucket não entra.
+[substitua as regras acima pelas que o dev confirmou na etapa 5.1]
+
+Exemplos reais meus (imite o tom e o tamanho, não o conteúdo):
+{EXEMPLOS_DE_ESTILO}
+[cole aqui, literalmente, os 2–3 pares Ontem/Hoje que o dev deu na etapa
+5.1; se ele não deu nenhum, remova este bloco inteiro — não invente]
+
+Gerar: "Ontem" (o que fiz) e "Hoje" (o que farei), seguindo o Estilo acima.
+Se o último dia útil foi feriado/fim de semana, "Ontem" vai em branco.
+
+[SE MULTI-INICIATIVA] Roteamento: agrupe a atividade pelo project key do
+Jira presente na issue e no nome do branch/mensagem do commit (padrão
+KEY-123), usando o mapa: {MAPA id -> jira_projects/repos}. Gere e envie um
+check-in POR iniciativa com atividade; iniciativas sem atividade hoje não
+recebem envio; atividade sem mapeamento vai para a iniciativa {DEFAULT} —
+mencione isso na notificação.
+
+Enviar (por iniciativa): pule a iniciativa cujo card já veio preenchido no GET
+da guarda 3 — reenviar duplicaria o check-in do dia. POST em
+/saude-entrega/daily — renove a sessão com
+um GET (o Set-Cookie devolve XSRF-TOKEN), mande o XSRF url-decodificado no
+header x-xsrf-token, headers x-inertia: true e x-requested-with:
+XMLHttpRequest. Body JSON: initiative_id, checkin_date (hoje, YYYY-MM-DD),
+yesterday_text, today_text, confidence_score: 5, blockers_text: "",
+yesterday_artifact_url: "". Se escrever o body num arquivo, mande com
+`--data @arquivo` (sem aspas em volta do @) — ver a regra de shell acima.
+
+Confirmar: o 302 NAO prova nada — o Inertia responde 302 tambem quando a
+validacao reprova (volta para a pagina com os erros na sessao). Depois do POST,
+refaca o GET e confira que o card da iniciativa veio com "existing"
+preenchido. Se nao veio, trate como FALHA: leia props.errors do data-page desse
+MESMO GET (e onde o Inertia entrega o bag de validacao; pode vir aninhado em
+props.errors.default) e notifique ❌ citando cada campo e a mensagem dele,
+marcando os que nao existem no payload acima como campo novo do formulario.
+Diga que o check-in de hoje precisa ser preenchido na mao e que o campo novo
+tem que ser mapeado no script. Excecao: se TODOS os campos do proprio payload
+voltarem como obrigatorio, o corpo nao chegou ao servidor (erro de transmissao
+do curl) — nao e campo novo; conserte a chamada e reenvie UMA vez, confirmando
+de novo.
+
+Notificar: ✅ com o resumo enviado (um por iniciativa) em sucesso; ❌ com a
+causa provável em falha (se for o cookie expirado, diga: "logue no Lab,
+exporte o config.json na extensão e rode /setup-checkin de novo"). Todo ❌
+termina dizendo que a rotina tenta de novo sozinha no próximo horário de hoje
+e que, se nenhuma tentativa passar, o check-in precisa ser preenchido na mão.
+[Telegram: via sendMessage no chat {CHAT_ID}]
+[E-mail pelo worker: POST {NOTIFY_URL}/notify com header
+x-notify-secret: {NOTIFY_SECRET} e body {"email": "{EMAIL}", "text": "<a
+mensagem>"} — 2xx é entregue. Qualquer outro status: registre o corpo da
+resposta E encerre a execução com erro (403 = domínio fora da allowlist do
+worker; 502 = worker sem RESEND_API_KEY; conexão recusada = host do worker
+fora da allowlist de egress). Aviso que não saiu com a execução marcada como
+sucesso é cego dos dois lados — o histórico da rotina tem que ficar vermelho]
+[E-mail pelo conector Gmail: envie para {EMAIL}, assunto "Check-in {DATA}"]
+[Sem canal: não notifique — mas em falha, encerre a execução com erro para
+ficar registrado no histórico da rotina]
+
+Erro não previsto (qualquer passo acima estourar — tool que sumiu, limite de
+token, comando preso em aprovação): antes de encerrar, tente notificar ❌ com
+o que deu errado; e encerre a execução com erro de qualquer jeito, mesmo que
+o aviso tenha saído. Falha calada é o pior desfecho possível: ninguém preenche
+o check-in e ninguém fica sabendo.
+
+Sinal de vida — a ÚLTIMA coisa que você faz, em todo e qualquer desfecho
+(enviou, falhou, ou parou numa guarda; fim de semana e feriado inclusive):
+POST {NOTIFY_URL}/notify com header x-notify-secret: {NOTIFY_SECRET} e body
+{"email": "{EMAIL}", "heartbeat": true}. Não manda e-mail nenhum — só avisa o
+worker que esta execução aconteceu. É o que permite ao worker cobrar por
+e-mail, no fim do dia, quando a rotina simplesmente não roda (pausada, sem
+crédito, ou morta antes de chegar até aqui) — a única falha que ela mesma
+nunca consegue reportar. Ping a mais não incomoda ninguém; ping a menos vira
+cobrança em falso.
+[só na variante "E-mail pelo worker" — nas outras, remova este bloco]
+```
+
+Deixe este bloco sempre presente no prompt, com uma das três variantes — é o
+único trecho que muda quando o dev resolver ligar notificação depois.
+
+## 7. Pós-setup (passos manuais do dev — itens 1 e 2 só no modo nuvem)
+
+1. **Allowlist de egress** do environment da rotina (só pela UI do claude.ai:
+   ícone do environment → engrenagem): liberar `lab.idealtrends.io`,
+   `api.telegram.org`, `*.atlassian.net` e `api.bitbucket.org` — mais o host do
+   worker se o canal for e-mail pelo `/notify`. No modo A,
+   no modo MCP, `*.atlassian.net` só é necessário se algo ainda chamar a API do
+   Jira direto — e confira na UI da rotina que os conectores Atlassian e Ideal
+   Lab estão habilitados para ela (conector desabilitado = rotina sem o Jira).
+2. **Teste real**: dispare uma execução manual da rotina (UI de routines) num
+   dia em que o check-in ainda não foi preenchido; confira o form no Lab e a
+   notificação. Alternativa sem esperar: rode agora os checks da etapa 4 de
+   novo e um dry-run (gerar o texto sem POST) mostrando ao dev o que seria
+   enviado. Pergunte se **o texto soou como ele** — se soou genérico, o
+   conserto é acrescentar exemplos no bloco `Estilo` (etapa 5.1) e atualizar
+   a rotina, não mexer em credencial.
+3. Lembre o dev: cookie expirou → ❌ no Telegram (ou no e-mail) → logar no Lab
+   → re-exportar na extensão → rodar `/setup-checkin` de novo (a skill atualiza
+   a rotina). E que existem **dois** avisos diferentes no canal de e-mail: o ❌
+   é a rotina dizendo que falhou; o "a rotina nao rodou hoje" é o worker
+   cobrando o silêncio dela — esse segundo quase sempre é a rotina pausada, sem
+   crédito, ou uma execução que morreu no meio (veja o histórico no claude.ai).
+4. Grave a versão mais recente do `CHANGELOG.md` em `.checkin-version` (arquivo
+   local, gitignored) — é o que faz o Claude avisar, no próximo `git pull`, que
+   saiu mudança que exige atualizar a rotina.

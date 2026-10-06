@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""Poller do bot do Telegram (@CheckInLabBot) para o lab-checkin.
+
+Escuta o chat via long-polling e implementa o /pular interativo:
+pergunta a data (botoes Hoje/Amanha ou texto DD/MM), confirma e registra
+o cancelamento como MENSAGEM FIXADA no chat, no formato:
+
+    SKIP: 2026-07-15, 2026-07-20 -- ...
+
+As rotinas cloud (preenchimento 10h / lembrete 14h) leem a mensagem fixada
+via getChat — que nao expira, ao contrario da fila do getUpdates (24h).
+Enquanto este poller roda, ele e o unico consumidor do getUpdates (um
+getUpdates concorrente das rotinas recebe 409, tratado como fallback la).
+
+Comandos: /pular [data], /retomar [data], /pulos, /cancelar.
+
+Roda como servico systemd de usuario (ver docs/telegram-integration.md).
+Credenciais: bloco "telegram" do config.json ao lado deste script.
+"""
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zoneinfo
+
+import inline_calendar
+
+DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(DIR, "config.json")
+CHECKIN_PATH = os.path.join(DIR, "checkin.sh")
+STATE_PATH = os.path.join(DIR, ".poller_state.json")
+SP = zoneinfo.ZoneInfo("America/Sao_Paulo")
+SKIP_MARKER = "SKIP:"
+WEEKDAYS_PT = ["segunda", "terca", "quarta", "quinta", "sexta", "sabado", "domingo"]
+
+HELP = (
+    "Comandos:\n"
+    "/pular — cancela o check-in automatico de um dia (pergunto a data)\n"
+    "/pular DD/MM — cancela direto para a data\n"
+    "/retomar DD/MM — desfaz um cancelamento\n"
+    "/pulos — lista os cancelamentos agendados\n"
+    "/status — estado do check-in de hoje + agendamento\n"
+    "/horario HH:MM — define o horario do check-in automatico\n"
+    "/pausar — pausa o check-in automatico (schedule.enabled=false)\n"
+    "/ativar — reativa o check-in automatico\n"
+    "/agora — roda o check-in agora (ignora o horario)\n"
+    "/dryrun — mostra o rascunho sem enviar\n"
+    "/cancelar — aborta a pergunta em andamento"
+)
+
+
+def log(msg):
+    print(f"[{datetime.datetime.now(SP):%F %T}] {msg}", flush=True)
+
+
+def load_config():
+    with open(CONFIG_PATH) as f:
+        t = json.load(f).get("telegram", {})
+    token, chat = t.get("bot_token", ""), str(t.get("chat_id", ""))
+    if not token or not chat:
+        sys.exit("ERRO: telegram.bot_token/chat_id ausentes no config.json")
+    return token, int(chat)
+
+
+TOKEN, CHAT_ID = load_config()
+
+
+def api(method, params=None, timeout=65):
+    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
+    data = urllib.parse.urlencode(params or {}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        log(f"API {method} HTTP {e.code}: {body[:200]}")
+        return {"ok": False, "error_code": e.code, "description": body}
+    except Exception as e:  # rede fora, timeout etc.
+        log(f"API {method} falhou: {e}")
+        return {"ok": False, "description": str(e)}
+
+
+def send(text, reply_markup=None):
+    params = {"chat_id": CHAT_ID, "text": text}
+    if reply_markup:
+        params["reply_markup"] = json.dumps(reply_markup)
+    return api("sendMessage", params)
+
+
+def today():
+    return datetime.datetime.now(SP).date()
+
+
+def parse_date(raw):
+    """Aceita: hoje, amanha, DD/MM, DD/MM/AAAA, AAAA-MM-DD. None se invalido."""
+    s = raw.strip().lower().replace("amanhã", "amanha")
+    if s == "hoje":
+        return today()
+    if s == "amanha":
+        return today() + datetime.timedelta(days=1)
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            return datetime.date(int(m[1]), int(m[2]), int(m[3]))
+        except ValueError:
+            return None
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", s)
+    if not m:
+        return None
+    day, month = int(m[1]), int(m[2])
+    year = int(m[3]) if m[3] else today().year
+    if year < 100:
+        year += 2000
+    try:
+        d = datetime.date(year, month, day)
+    except ValueError:
+        return None
+    if not m[3] and d < today():  # DD/MM sem ano e ja passou -> proximo ano
+        d = datetime.date(year + 1, month, day)
+    return d
+
+
+def fmt(d):
+    return f"{d:%d/%m} ({WEEKDAYS_PT[d.weekday()]})"
+
+
+# --- mensagem fixada com as datas de skip ---------------------------------
+
+def get_skips():
+    """Retorna (pinned_message | None, [datas ISO ordenadas])."""
+    r = api("getChat", {"chat_id": CHAT_ID})
+    pm = r.get("result", {}).get("pinned_message")
+    if not pm or SKIP_MARKER not in (pm.get("text") or ""):
+        return None, []
+    dates = sorted(set(re.findall(r"\d{4}-\d{2}-\d{2}", pm["text"])))
+    return pm, dates
+
+
+def write_skips(pm, dates):
+    """Regrava a mensagem fixada com `dates` (ISO), descartando datas passadas."""
+    dates = sorted(d for d in set(dates) if d >= today().isoformat())
+    if not dates:
+        if pm:
+            api("unpinChatMessage", {"chat_id": CHAT_ID, "message_id": pm["message_id"]})
+            api("deleteMessage", {"chat_id": CHAT_ID, "message_id": pm["message_id"]})
+        return
+    text = (
+        f"{SKIP_MARKER} {', '.join(dates)} — o check-in automatico NAO sera "
+        "enviado nessas datas (agendado via /pular; desfaca com /retomar)"
+    )
+    if pm:
+        api("editMessageText", {"chat_id": CHAT_ID, "message_id": pm["message_id"], "text": text})
+    else:
+        r = send(text)
+        if r.get("ok"):
+            api("pinChatMessage", {
+                "chat_id": CHAT_ID,
+                "message_id": r["result"]["message_id"],
+                "disable_notification": True,
+            })
+
+
+# --- comandos ---------------------------------------------------------------
+
+def do_pular(d):
+    if d is None:
+        send("Nao entendi a data. Manda DD/MM (ex: 21/07), \"hoje\" ou \"amanha\".")
+        return False
+    if d < today():
+        send(f"{fmt(d)} ja passou — nada a cancelar.")
+        return True
+    if d.weekday() >= 5:
+        send(f"{fmt(d)} e fim de semana — o check-in nem roda nesse dia, nada a cancelar.")
+        return True
+    pm, dates = get_skips()
+    if d.isoformat() in dates:
+        send(f"O check-in de {fmt(d)} ja estava cancelado.")
+        return True
+    write_skips(pm, dates + [d.isoformat()])
+    send(f"🚫 Fechado! Vou pular o check-in de {fmt(d)}. Pra desfazer: /retomar {d:%d/%m}")
+    log(f"skip agendado: {d}")
+    return True
+
+
+def do_retomar(arg):
+    pm, dates = get_skips()
+    if not dates:
+        send("Nao ha nenhum cancelamento agendado.")
+        return
+    if arg:
+        d = parse_date(arg)
+        if d is None:
+            send("Nao entendi a data. Ex: /retomar 21/07")
+            return
+    elif len(dates) == 1:
+        d = datetime.date.fromisoformat(dates[0])
+    else:
+        send("Ha mais de um cancelamento agendado: "
+             + ", ".join(f"{datetime.date.fromisoformat(x):%d/%m}" for x in dates)
+             + ". Especifique: /retomar DD/MM")
+        return
+    if d.isoformat() not in dates:
+        send(f"{fmt(d)} nao estava cancelado. Agendados: "
+             + ", ".join(f"{datetime.date.fromisoformat(x):%d/%m}" for x in dates))
+        return
+    write_skips(pm, [x for x in dates if x != d.isoformat()])
+    send(f"✅ Cancelamento desfeito — o check-in de {fmt(d)} volta a ser enviado normalmente.")
+    log(f"skip removido: {d}")
+
+
+def do_pulos():
+    _, dates = get_skips()
+    if not dates:
+        send("Nenhum cancelamento agendado — check-ins seguem normais.")
+    else:
+        send("Check-ins cancelados: "
+             + ", ".join(fmt(datetime.date.fromisoformat(x)) for x in dates))
+
+
+# --- agendamento (schedule) + execucao do checkin.sh (Func.2) ----------------
+
+def load_full_config():
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def set_schedule(**changes):
+    cfg = load_full_config()
+    sched = cfg.get("schedule") or {}
+    sched.update(changes)
+    cfg["schedule"] = sched
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    return sched
+
+
+def run_checkin(args, timeout=180):
+    try:
+        p = subprocess.run(
+            ["bash", CHECKIN_PATH, *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        out = (p.stdout + p.stderr).strip()
+        return out or "(sem saida)"
+    except Exception as e:  # noqa: BLE001
+        return f"ERRO ao rodar checkin.sh: {e}"
+
+
+def do_status():
+    s = (load_full_config().get("schedule") or {})
+    enabled = s.get("enabled", True)
+    hhmm = s.get("time") or "(nao definido)"
+    out = run_checkin(["status"])
+    send(f"⏰ Agendamento: {'ativo' if enabled else 'PAUSADO'}, horario {hhmm}\n\n{out}")
+
+
+def do_horario(arg):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", arg.strip())
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        send("Formato invalido. Use /horario HH:MM (ex: 09:30).")
+        return
+    hhmm = f"{int(m[1]):02d}:{m[2]}"
+    set_schedule(time=hhmm)
+    send(f"✅ Horario do check-in automatico atualizado para {hhmm}.")
+    log(f"schedule.time -> {hhmm}")
+
+
+def do_pausar():
+    set_schedule(enabled=False)
+    send("⏸️ Check-in automatico pausado. Reative com /ativar.")
+    log("schedule.enabled -> False")
+
+
+def do_ativar():
+    set_schedule(enabled=True)
+    send("▶️ Check-in automatico reativado.")
+    log("schedule.enabled -> True")
+
+
+def do_agora():
+    send("Rodando o check-in agora (ignorando o horario)...")
+    send(run_checkin(["auto", "--force"]))
+
+
+def do_dryrun():
+    send("Gerando o rascunho (sem enviar)...")
+    send(run_checkin(["auto", "--dry-run"]))
+
+
+# --- loop principal ----------------------------------------------------------
+
+pending = None  # 'pular' quando aguardando a data
+
+
+def ask_date():
+    global pending
+    pending = "pular"
+    send("Pular o check-in de quando?", reply_markup={
+        "inline_keyboard": [
+            [
+                {"text": "Hoje", "callback_data": "pular:hoje"},
+                {"text": "Amanha", "callback_data": "pular:amanha"},
+            ],
+            [{"text": "Escolher no calendario", "callback_data": "pular:calendario"}],
+        ]
+    })
+    # ou responder com a data em texto: DD/MM
+
+
+def handle_text(text):
+    global pending
+    t = text.strip()
+    low = t.lower()
+    if low.startswith("/pular"):
+        pending = None
+        arg = t[len("/pular"):].strip()
+        if arg:
+            do_pular(parse_date(arg))
+        else:
+            ask_date()
+            send("(ou responda com a data: DD/MM)")
+    elif low.startswith("/retomar"):
+        pending = None
+        do_retomar(t[len("/retomar"):].strip())
+    elif low.startswith("/pulos"):
+        pending = None
+        do_pulos()
+    elif low.startswith("/status"):
+        pending = None
+        do_status()
+    elif low.startswith("/horario"):
+        pending = None
+        do_horario(t[len("/horario"):].strip())
+    elif low.startswith("/pausar"):
+        pending = None
+        do_pausar()
+    elif low.startswith("/ativar"):
+        pending = None
+        do_ativar()
+    elif low.startswith("/agora"):
+        pending = None
+        do_agora()
+    elif low.startswith("/dryrun"):
+        pending = None
+        do_dryrun()
+    elif low.startswith("/cancelar"):
+        pending = None
+        send("Ok, deixa pra la.")
+    elif low.startswith("/"):
+        pending = None
+        send(HELP)
+    elif pending == "pular":
+        if do_pular(parse_date(t)):
+            pending = None
+    else:
+        send(HELP)
+
+
+def set_markup(message_id, markup=None):
+    """Troca (ou remove, com markup=None) os botoes de uma mensagem ja enviada."""
+    params = {"chat_id": CHAT_ID, "message_id": message_id}
+    if markup:
+        params["reply_markup"] = json.dumps(markup)
+    api("editMessageReplyMarkup", params)
+
+
+CAL_TEXT = ("Toque nos dias em que o check-in NAO deve rodar e confirme.\n"
+            "Os que ja estao agendados vem marcados — desmarcar retoma o dia.\n"
+            "Ou responda com DD/MM.")
+
+
+def cal_blocked(d):
+    """Dia em que o check-in nao roda — logo, nao ha o que pular."""
+    if d < today():
+        return "ja passou"
+    return "e fim de semana — o check-in nao roda" if d.weekday() >= 5 else ""
+
+
+def show_calendar(message_id, month, sel=()):
+    """Redesenha o calendario (texto + teclado) no lugar; a selecao vai no texto."""
+    api("editMessageText", {
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+        "text": inline_calendar.text(CAL_TEXT, sel),
+        "reply_markup": json.dumps({"inline_keyboard": inline_calendar.keyboard(
+            month, start=today(), enabled=lambda d: d.weekday() < 5, sel=sel)}),
+    })
+
+
+def open_calendar(message_id):
+    """Abre ja marcando o que esta agendado."""
+    _, dates = get_skips()
+    sel = [d for d in (datetime.date.fromisoformat(x) for x in dates) if not cal_blocked(d)]
+    show_calendar(message_id, today(), sel)
+
+
+def cal_confirm(sel):
+    """A selecao E o estado final desejado: grava uma vez e conta o diff."""
+    pm, dates = get_skips()
+    atuais = [x for x in dates if not cal_blocked(datetime.date.fromisoformat(x))]
+    novos = [d.isoformat() for d in sel]
+    add = [x for x in novos if x not in atuais]
+    rem = [x for x in atuais if x not in novos]
+    if not add and not rem:
+        send("Nada mudou — a lista de pulos continua a mesma.")
+        return
+    write_skips(pm, novos)
+    partes = []
+    if add:
+        partes.append("🚫 Vou pular: " + ", ".join(fmt(datetime.date.fromisoformat(x)) for x in add))
+    if rem:
+        partes.append("✅ Volta a rodar: " + ", ".join(fmt(datetime.date.fromisoformat(x)) for x in rem))
+    send("\n".join(partes) + "\n\nPra mexer de novo: /pular")
+    log(f"pulos gravados: {novos}")
+
+
+def handle_callback(cq):
+    global pending
+    msg = cq.get("message")
+    mid = msg["message_id"] if msg else None
+    data = cq.get("data", "")
+    picked = inline_calendar.parse(data)
+
+    # Dia bloqueado nao muda nada: a resposta do callback E o feedback (balao).
+    why = cal_blocked(picked[1]) if picked and picked[0] == "blocked" else ""
+    answer = {"callback_query_id": cq["id"]}
+    if why:
+        answer["text"] = f"{fmt(picked[1])} {why}."
+    api("answerCallbackQuery", answer)
+
+    if picked:
+        kind, d = picked
+        sel = inline_calendar.selection(msg.get("text") if msg else None, parse_date)
+        if kind == "blocked":
+            return
+        if kind == "nav":  # so redesenha o mes, a selecao continua no texto
+            show_calendar(mid, d, sel)
+        elif kind == "toggle":
+            show_calendar(mid, d, [x for x in sel if x != d] if d in sel else sorted(sel + [d]))
+        else:
+            set_markup(mid)
+            pending = None
+            if kind == "ok":
+                cal_confirm(sel)
+            else:
+                send("Ok, nada mudou.")
+    elif data == "pular:calendario":
+        open_calendar(mid)
+    elif data.startswith("pular:"):
+        set_markup(mid)
+        pending = None
+        do_pular(parse_date(data.split(":", 1)[1]))
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+def main():
+    api("setMyCommands", {"commands": json.dumps([
+        {"command": "pular", "description": "Cancelar o check-in automatico de um dia"},
+        {"command": "retomar", "description": "Desfazer um cancelamento (/retomar DD/MM)"},
+        {"command": "pulos", "description": "Listar cancelamentos agendados"},
+        {"command": "status", "description": "Estado do check-in de hoje + agendamento"},
+        {"command": "horario", "description": "Definir horario do automatico (/horario HH:MM)"},
+        {"command": "pausar", "description": "Pausar o check-in automatico"},
+        {"command": "ativar", "description": "Reativar o check-in automatico"},
+        {"command": "agora", "description": "Rodar o check-in agora"},
+        {"command": "dryrun", "description": "Mostrar o rascunho sem enviar"},
+    ])})
+    state = load_state()
+    offset = state.get("offset")
+    if offset is None:
+        # primeira execucao: descarta o backlog para nao responder mensagens antigas
+        r = api("getUpdates", {"timeout": 0})
+        upds = r.get("result", [])
+        offset = (upds[-1]["update_id"] + 1) if upds else 0
+        save_state({"offset": offset})
+        log(f"backlog de {len(upds)} update(s) descartado")
+    log(f"poller iniciado (chat {CHAT_ID}, offset {offset})")
+
+    last_cleanup = None
+    while True:
+        if last_cleanup != today():  # remove datas passadas da mensagem fixada
+            pm, dates = get_skips()
+            if pm:
+                write_skips(pm, dates)
+            last_cleanup = today()
+        r = api("getUpdates", {"offset": offset, "timeout": 50})
+        if not r.get("ok"):
+            time.sleep(10 if r.get("error_code") == 409 else 5)
+            continue
+        for u in r["result"]:
+            offset = u["update_id"] + 1
+            try:
+                if "callback_query" in u:
+                    cq = u["callback_query"]
+                    if cq["from"]["id"] == CHAT_ID:
+                        handle_callback(cq)
+                elif "message" in u:
+                    m = u["message"]
+                    if m["chat"]["id"] == CHAT_ID and m.get("text"):
+                        log(f"msg: {m['text']!r}")
+                        handle_text(m["text"])
+            except Exception as e:
+                log(f"erro processando update {u.get('update_id')}: {e}")
+        if r["result"]:
+            save_state({"offset": offset})
+
+
+if __name__ == "__main__":
+    main()

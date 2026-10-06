@@ -9,9 +9,34 @@
     "username": "your-bitbucket-username-or-empty-if-using-api-token",
     "app_password": "your-bitbucket-app-password-or-empty-if-using-api-token",
     "workspace": "your-workspace-id",
-    "repositories": []
+    "project_key": "",
+    "repositories": ["auditoriaideal"],
+    "repositories_exclude": ["-old$"],
+    "author_emails": []
   },
+  "llm_provider": "gemini",
   "gemini": {
     "api_key": ""
+  },
+  "anthropic": {
+    "api_key": ""
+  },
+  "telegram": {
+    "bot_token": "",
+    "chat_id": "",
+    "webhook_secret": ""
+  },
+  "notify": {
+    "url": "",
+    "secret": "",
+    "email": ""
+  },
+  "schedule": {
+    "time": "",
+    "enabled": true
+  },
+  "initiative_config": {
+    "repos": {},
+    "projects": {}
   }
 }
