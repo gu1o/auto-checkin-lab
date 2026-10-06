@@ -229,7 +229,8 @@ is_skipped() {
     # Respeita o /pular do bot: le a mensagem fixada do chat com o
     # @CheckInLabBot ("SKIP: YYYY-MM-DD, ...") via getChat. Mesmo contrato do
     # notify(): sem telegram no config.json, nao checa; falha na chamada nao
-    # bloqueia o check-in (mesma filosofia das rotinas cloud).
+    # bloqueia o check-in (mesma filosofia das rotinas cloud). Retorno: 0 =
+    # pulado, 1 = nao pulado, 2 = nao deu para ler o Telegram.
     local creds token chat_id pinned today
     [ -f "$CONFIG" ] || return 1
     creds="$(python3 -c '
@@ -253,10 +254,12 @@ except Exception:
 import json, sys
 try:
     r = json.load(sys.stdin)
-    print((r.get("result") or {}).get("pinned_message", {}).get("text", ""))
 except Exception:
-    pass
-')" || return 1
+    sys.exit(3)
+if r.get("ok") is not True:
+    sys.exit(3)
+print((r.get("result") or {}).get("pinned_message", {}).get("text", ""))
+')" || return 2
     today="$(date +%F)"
     case "$pinned" in
         *SKIP:*"$today"*) return 0 ;;
@@ -496,6 +499,13 @@ cmd_auto() {
     #    dia pulado rendia um 🚫 por tick. Dia sem atividade NAO grava estado —
     #    de proposito, para o tick da tarde pegar o commit que apareceu depois.
     local motivo_dia
+    # Excecao: dia fechado pelo /pular do bot e destravado se o dev deu /retomar
+    # no bot depois — esse retomar so mexe na mensagem fixada, nao neste arquivo.
+    # Telegram fora do ar (2) nao destrava: na duvida, o dia segue pulado.
+    if motivo_dia="$(day_done)" && [ "$motivo_dia" = "pulado no bot" ]; then
+        local sk=0; is_skipped || sk=$?
+        [ "$sk" -eq 1 ] && rm -f "$AUTO_STATE"
+    fi
     if [ "$dry_run" != "true" ] && [ "$force" != "true" ] && motivo_dia="$(day_done)"; then
         echo "Check-in de hoje ja resolvido ($motivo_dia). Nada a fazer."
         NOTIFY_ON_ERR=false

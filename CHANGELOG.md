@@ -16,6 +16,21 @@ prompt da rotina (`# lab-checkin roteiro <versão>`).
 
 ---
 
+## 2026-10-06 — `[worker]` `[cli]` (review antes do merge)
+
+- **`/pular` e `/retomar` com período:** `amanha-09/10` e `amanha a 09/10`
+  voltaram a funcionar (o "a" de "amanha" era lido como separador), e período
+  já começado vale de hoje em diante — `/retomar 01/10-09/10` no meio das férias
+  retoma os dias que faltam em vez de responder "não entendi".
+- **Cron local:** `/retomar hoje` no bot destrava o dia que o `/pular` tinha
+  fechado no `.auto_state.json`. Se o Telegram não responder, o dia segue pulado.
+- **Watchdog:** só o heartbeat da rotina da nuvem arma a cobrança — notificação
+  entregue (runner do worker, cron local) não arma mais, e era isso que gerava
+  "a rotina não rodou" falso. O dia pulado pelo `/pular` do bot também deixa de
+  ser cobrado.
+- **Bot:** `/pular` no meio do cadastro não apaga a etapa pendente, e confirmar
+  no calendário limpa a espera por data (o texto seguinte não vira data).
+
 ## 2026-10-06 — `[rotina]`
 
 **"Nenhum módulo ativo nesta data" agora para a rotina.** A guarda de sem

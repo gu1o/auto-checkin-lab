@@ -226,8 +226,9 @@ function fmt(iso) {
   return `${d}/${m} (${WD_PT[weekday(iso)]})`;
 }
 
-/** Aceita: hoje, amanha, DD/MM, DD/MM/AAAA, AAAA-MM-DD. Retorna ISO ou null. */
-function parseDate(raw) {
+/** Aceita: hoje, amanha, DD/MM, DD/MM/AAAA, AAAA-MM-DD. Retorna ISO ou null.
+ *  `roll`: DD/MM sem ano que ja passou vai para o ano seguinte (data avulsa). */
+function parseDate(raw, roll = true) {
   const s = raw.trim().toLowerCase().replace('amanhã', 'amanha');
   const today = todayIso();
   if (s === 'hoje') return today;
@@ -240,25 +241,40 @@ function parseDate(raw) {
   const mon = m[2].padStart(2, '0');
   const year = m[3] ? (m[3].length === 2 ? '20' + m[3] : m[3]) : today.slice(0, 4);
   let iso = validIso(`${year}-${mon}-${day}`);
-  if (iso && !m[3] && iso < today) iso = validIso(`${Number(year) + 1}-${mon}-${day}`);
+  if (roll && iso && !m[3] && iso < today) iso = nextYear(iso);
   return iso;
 }
 
-/** Data unica ou periodo ("21/07-25/07", "21/07 a 25/07"). Retorna [] se invalido. */
+function nextYear(iso) {
+  return validIso(`${Number(iso.slice(0, 4)) + 1}${iso.slice(4)}`);
+}
+
+/** Data unica ou periodo ("21/07-25/07", "21/07 a 25/07"). Retorna [] se invalido.
+ *  Periodo ja comecado vale de hoje em diante (/retomar no meio das ferias). */
 function parseDates(raw) {
   const one = parseDate(raw);
   if (one) return [one];
-  const m = raw.trim().toLowerCase().match(/^(.+?)\s*(?:at[eé]|a|-|–|\.\.)\s*(.+)$/);
-  if (!m) return [];
-  const from = parseDate(m[1]);
-  const to = parseDate(m[2]);
-  if (!from || !to || to < from) return [];
-  const out = [];
-  for (let d = from; d <= to; d = addDays(d, 1)) {
-    if (out.length > 90) return []; // periodo absurdo: trata como nao entendido
-    out.push(d);
+  const s = raw.trim().toLowerCase();
+  const today = todayIso();
+  // Tenta cada separador possivel: o primeiro "a" de "amanha", ou o "-" de uma
+  // data ISO, nao podem ser lidos como separador.
+  for (const m of s.matchAll(/\s+(?:at[eé]|a)\s+|\s*(?:-|–|\.\.)\s*/g)) {
+    const a = s.slice(0, m.index);
+    const b = s.slice(m.index + m[0].length);
+    const semAno = ![a, b].some((x) => /^\d{4}-|\/\d{1,2}\/\d{2,4}$/.test(x.trim()));
+    let from = parseDate(a, false);
+    let to = parseDate(b, false);
+    if (!from || !to) continue;
+    if (semAno && to < from) to = nextYear(to); // 28/12-03/01
+    if (semAno && to && to < today) [from, to] = [nextYear(from), nextYear(to)];
+    if (!from || !to || to < from) return [];
+    if (addDays(from, 91) <= to) return []; // periodo absurdo: trata como nao entendido
+    if (from < today) from = today;
+    const out = [];
+    for (let d = from; d <= to; d = addDays(d, 1)) out.push(d);
+    return out;
   }
-  return out;
+  return [];
 }
 
 // --- mensagem fixada com as datas de skip (sempre no chat de origem) ----------
@@ -374,7 +390,10 @@ async function doPulos(env, chatId) {
 async function setPendingPular(env, chatId, user, on = true) {
   if (!user) return;
   user.prefs = user.prefs || {};
-  if (on) user.prefs._pending = 'pular';
+  if (on) {
+    if (user.prefs._pending) return; // cadastro em andamento: nao atropela a etapa
+    user.prefs._pending = 'pular';
+  }
   else if (user.prefs._pending === 'pular') delete user.prefs._pending;
   else return;
   await putUser(env, chatId, user);
@@ -468,6 +487,8 @@ async function handlePicker(request, url, env) {
     ? agendados.filter((d) => !sel.includes(d))
     : [...new Set([...agendados, ...sel])].sort();
   await calConfirm(env, chatId, final);
+  // A data veio pelo calendario: o proximo texto livre nao e mais uma data.
+  await setPendingPular(env, chatId, chatId === adminId(env) ? await ensureAdminUser(env) : await getUser(env, chatId), false);
   return jsonCors({ ok: true });
 }
 
@@ -1062,10 +1083,9 @@ async function deliver(env, chatId, text, askedEmail = '') {
   const email = askedEmail || user?.prefs?.email || '';
   let delivered = false;
   if (email) {
+    // Entrega NAO arma o watchdog: runner do worker e cron local tambem passam
+    // aqui e nao mandam heartbeat — so a rotina da nuvem (heartbeat) e cobrada.
     delivered = await sendEmail(env, email, 'Auto Check-in', text);
-    // Notificacao entregue tambem e sinal de vida — arma o watchdog sem exigir
-    // cadastro: quem ja recebe aviso passa a ser cobrado quando parar de avisar.
-    if (delivered) await touchWatch(env, email);
   }
   if (!delivered && chatId) delivered = !!(await send(env, chatId, text)).ok;
   return { delivered, email };
@@ -2245,7 +2265,7 @@ function scheduleGate(prefs) {
 // Por isso a rotina pinga /notify com heartbeat:true em TODO desfecho (inclusive
 // quando para nas guardas), e o tick do fim do dia cobra quem nao pingou.
 // Registro: watch:<email> = { email, last, alerted }. Nasce sozinho no primeiro
-// heartbeat (ou na primeira notificacao entregue) e morre de TTL 30 dias depois
+// heartbeat e morre de TTL 30 dias depois
 // do ultimo sinal de vida — rotina abandonada para de cobrar sozinha.
 // ponytail: cobranca num horario fixo para todo mundo; se alguem agendar a
 // rotina depois das 18h SP, o jeito e um horario por dev no registro.
@@ -2287,6 +2307,32 @@ const WATCHDOG_TEXT = (today) =>
   '3. Se o cookie do Lab expirou: logue no Lab, exporte o config.json na extensao ' +
   'e rode /setup-checkin de novo.';
 
+// email -> chat_id de quem tem prefs.email, para o watchdog enxergar tambem o
+// /pular do bot (mensagem fixada), e nao so o skip do `checkin.sh pular`.
+async function chatsByEmail(env) {
+  const map = new Map();
+  let cursor;
+  do {
+    const list = await env.USERS.list({ prefix: 'user:', cursor });
+    cursor = list.list_complete ? undefined : list.cursor;
+    for (const k of list.keys) {
+      const u = await getUser(env, Number(k.name.slice('user:'.length)));
+      const e = (u?.prefs?.email || '').trim().toLowerCase();
+      if (e) map.set(e, Number(k.name.slice('user:'.length)));
+    }
+  } while (cursor);
+  return map;
+}
+
+async function pinnedSkipToday(env, chatId, today) {
+  if (!chatId) return false;
+  try {
+    return (await getSkips(env, chatId)).dates.includes(today);
+  } catch {
+    return false; // Telegram fora: cobra, como antes
+  }
+}
+
 // `hour` e `today` sao parametros so para o teste conseguir fixar o relogio.
 async function watchdogCron(env, hour = spHour(), today = todayIso()) {
   // So no fim do dia: mais cedo, a rotina de quem roda de tarde ainda nao rodou
@@ -2299,6 +2345,7 @@ async function watchdogCron(env, hour = spHour(), today = todayIso()) {
   const wd = weekday(today);
   if (wd === 0 || wd === 6) return;
   if (await isHolidayIso(today)) return;
+  let chats; // so lista os usuarios se houver alguem para cobrar
   let cursor;
   do {
     const list = await env.USERS.list({ prefix: 'watch:', cursor });
@@ -2314,6 +2361,7 @@ async function watchdogCron(env, hour = spHour(), today = todayIso()) {
       }
       if (!w.email || w.last === today || w.alerted === today) continue;
       if ((await readEmailSkips(env, w.email, today)).includes(today)) continue; // dia que o dev pulou
+      if (await pinnedSkipToday(env, (chats ??= await chatsByEmail(env)).get(w.email.trim().toLowerCase()), today)) continue; // /pular do bot
       const sent = await sendEmail(env, w.email, 'Auto Check-in — a rotina nao rodou hoje', WATCHDOG_TEXT(today));
       if (!sent) {
         console.error('watchdog: e-mail nao entregue', w.email);

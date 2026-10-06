@@ -27,6 +27,21 @@ for (const sep of ['-', ' a ', ' ate ', ' até ', '..']) {
   assert.deepStrictEqual(parseDates(`${dm(d1)}${sep}${dm(d3)}`), [d1, d2, d3], sep);
 }
 
+// periodo comecando em "amanha" (o "a" de amanha nao e separador)
+const amanha = mais(1);
+const ateD3 = parseDates(`amanha-${dm(d3)}`);
+assert.strictEqual(ateD3[0], amanha);
+assert.strictEqual(ateD3[ateD3.length - 1], d3);
+assert.deepStrictEqual(parseDates(`amanha a ${dm(d3)}`), ateD3);
+
+// periodo ja comecado vale de hoje em diante (/retomar no meio das ferias)
+const ontem = mais(-1);
+if (ontem.slice(0, 4) === d3.slice(0, 4)) {
+  const r = parseDates(`${dm(ontem)}-${dm(d3)}`);
+  assert.strictEqual(r[0], todayIso());
+  assert.strictEqual(r[r.length - 1], d3);
+}
+
 // lixo e periodos invertidos/absurdos nao viram data
 for (const raw of ['ontem', '32/08', '28/08-26/08', '01/01-31/12', '']) {
   assert.deepStrictEqual(parseDates(raw), [], raw);

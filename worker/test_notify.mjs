@@ -105,6 +105,24 @@ env = fakeEnv([
 await watchdogCron(env, 18, HOJE);
 assert.equal(sent.length, 0, 'dia pulado nao pode virar cobranca');
 
+// dia pulado pelo /pular do bot (mensagem fixada) tambem nao
+sent = [];
+const fetchAntes = globalThis.fetch;
+globalThis.fetch = async (url, opts) => {
+  if (String(url).includes('getChat')) {
+    return { ok: true, json: async () => ({ ok: true, result: { pinned_message: { text: `SKIP: ${HOJE}` } } }) };
+  }
+  return fetchAntes(url, opts);
+};
+env = fakeEnv([
+  ['watch:dev@x.com', JSON.stringify({ email: 'dev@x.com', last: '2026-08-26' })],
+  ['user:7', JSON.stringify({ status: 'active', prefs: { email: 'Dev@x.com' } })],
+]);
+env.BOT_TOKEN = 't';
+await watchdogCron(env, 18, HOJE);
+assert.equal(sent.length, 0, '/pular do bot nao pode virar cobranca');
+globalThis.fetch = fetchAntes;
+
 // e-mail que nao saiu nao pode ser marcado como cobrado
 sent = [];
 globalThis.fetch = async () => ({ ok: false, status: 422, text: async () => 'nope' });
@@ -133,7 +151,7 @@ let hits = canais();
 let r = await deliver(comEmail, 7, '❌ falhou');
 assert.deepEqual(hits.map((h) => h.via), ['email'], 'prefs.email manda no canal — era o furo do runnerCron');
 assert.ok(r.delivered && r.email === 'dev@x.com');
-assert.ok(comEmail._kv.get('watch:dev@x.com'), 'notificacao entregue arma o watchdog');
+assert.ok(!comEmail._kv.get('watch:dev@x.com'), 'so heartbeat arma o watchdog — runner/cron local nao pingam');
 
 const semEmail = fakeEnv([['user:8', JSON.stringify({ status: 'active', prefs: {} })]]);
 semEmail.BOT_TOKEN = 't';
