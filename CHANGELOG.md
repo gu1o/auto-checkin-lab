@@ -16,6 +16,18 @@ prompt da rotina (`# lab-checkin roteiro <versão>`).
 
 ---
 
+## 2026-10-06 — `[rotina]`
+
+**"Nenhum módulo ativo nesta data" agora para a rotina.** A guarda de sem
+convocação só olhava `props.cards` vazio. Em 06/10 o Lab mostrava essa tela
+(alocação em módulos concluídos/versões encerradas) e a execução das 10h ainda
+viu o card da iniciativa 6 com `existing: null`, seguiu para a coleta e acabaria
+em ⚠️ "sem atividade" ou ❌ de envio reprovado. A guarda 3 passa a valer também
+com `props.semConvocacao` preenchido ou card sem módulo ativo; continua
+checando a cada retentativa, e o ℹ️ sai uma vez, na última. A rotina também
+lista no relatório os nomes das chaves do data-page, para portar a guarda para
+o `checkin.sh`/worker quando o formato estiver confirmado.
+
 ## 2026-09-17 — `[rotina]` `[cli]` `[worker]`
 
 **Dia sem check-in agora é decidido uma vez, não três.** A retentativa em três

@@ -401,10 +401,18 @@ vida do fim deste prompt ANTES de parar: parada é desfecho, não é sumiço):
    e veja se a data de hoje está no `dates` da resposta. Se o curl falhar ou não
    devolver JSON, **siga com o check-in** em vez de parar: consulta que caiu não
    é dia pulado, e parar aqui seria um dia sem check-in e sem ninguém avisado.]
-3. O Lab não pediu check-in hoje: `props.cards` vem VAZIO e `props.semConvocacao`
-   diz o motivo (janela fechada, módulo concluído, versão encerrada). NÃO é erro
-   e retentar não muda nada — encerre sem erro, notificando ℹ️ com o motivo só na
-   última execução do dia. Sem esta guarda o dia vira três ❌ iguais.
+3. O Lab não pediu check-in hoje — na tela aparece "Nenhum módulo ativo nesta
+   data" (há alocação, mas nenhum módulo/versão ativo hoje). Vale se QUALQUER um
+   destes aparecer no data-page: (a) `props.cards` VAZIO; (b) `props.semConvocacao`
+   não nulo e sem card da minha iniciativa; (c) o card da minha iniciativa existe
+   mas sem módulo ativo hoje (lista de módulos vazia, módulo nulo ou flag
+   equivalente). O motivo e os módulos vêm em `props.semConvocacao` (`motivo`,
+   `modulos[].nome`/`motivo`). NÃO é erro — encerre sem erro e sem coletar
+   Jira/Bitbucket. As retentativas checam de novo (a alocação pode mudar no dia);
+   o ℹ️ com o motivo sai só na última execução do dia. Sem esta guarda o dia vira
+   ⚠️ "sem atividade" ou ❌ de envio reprovado. No relatório final, liste os NOMES
+   das chaves de `props` e do card (sem valores) — é o que permite endurecer a
+   guarda no `checkin.sh`/worker depois.
 4. O check-in de hoje já está preenchido (GET em
    https://lab.idealtrends.io/saude-entrega/daily com o cookie; os cards vêm
    no atributo data-page, HTML-escaped). É esta guarda que faz a retentativa
